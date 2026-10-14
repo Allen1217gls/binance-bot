@@ -120,9 +120,23 @@ class BinanceClient:
         return self._safe_request("POST", "/fapi/v1/order", data=p)
 
     def set_sl(self, sym: str, side: str, price: float):
-        p = {"symbol": sym.upper(), "side": side.upper(), "type": "STOP_MARKET", "stopPrice": round(price, 2), "closePosition": "true", "timestamp": int(time.time() * 1000) + self.time_offset}
+        p = {
+            "symbol": sym.upper(), 
+            "side": side.upper(), 
+            "type": "STOP_MARKET", 
+            "stopPrice": round(price, 2), 
+            "closePosition": "true", 
+            "timestamp": int(time.time() * 1000) + self.time_offset
+        }
         p["signature"] = self._sign(p)
-        return self._safe_request("POST", "/fapi/v1/order", data=p)
+        res = self._safe_request("POST", "/fapi/v1/order", data=p)
+        
+        if isinstance(res, dict) and "orderId" in res:
+            logger.info(f"✅ 強制止損單掛單成功！價格: {price}, 訂單ID: {res.get('orderId')}")
+            return True
+        else:
+            logger.error(f"❌ 幣安拒絕止損單！完整回應: {res}")
+            return False
 
     def cancel_all(self, sym: str):
         p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
@@ -157,7 +171,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Optimized Rate-Limit Protected Bot"}
+    return {"status": "online", "feature": "Strict Stop-Loss Protected Bot"}
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
@@ -215,15 +229,29 @@ async def handle_webhook(request: Request):
             raise HTTPException(status_code=400, detail="計算倉位低於最小下單量")
 
         side = "BUY" if action == "LONG" else "SELL"
-        client.order(sym, side, target_qty)
-        client.set_sl(sym, "SELL" if side == "BUY" else "BUY", sig.stop_loss)
+        sl_side = "SELL" if side == "BUY" else "BUY"
+
+        # 1. 執行市價開單
+        order_res = client.order(sym, side, target_qty)
+        if not isinstance(order_res, dict) or "orderId" not in order_res:
+            logger.error(f"❌ 開倉失敗: {order_res}")
+            raise HTTPException(status_code=400, detail="幣安拒絕開倉")
+
+        # 2. 🛡️ 強制掛上止損單
+        sl_success = client.set_sl(sym, sl_side, sig.stop_loss)
+        
+        # 3. 如果止損單掛單失敗，為了防止裸奔爆倉，立即發起緊急平倉！
+        if not sl_success:
+            logger.critical(f"🚨 嚴重警告：止損單掛單失敗！為了防止爆倉，正在執行緊急市價平倉...")
+            client.order(sym, sl_side, target_qty, reduce_only=True)
+            raise HTTPException(status_code=400, detail="止損單設定失敗，已執行緊急平倉保護")
+
         trade_memory[sym] = {"entry_p": curr_p, "qty": target_qty}
-        logger.info(f"開單成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 下單顆數={target_qty}{sym}")
-        return {"success": True, "qty": target_qty}
+        logger.info(f"✅ 開單與強制止損全套成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 顆數={target_qty}{sym}, 止損價={sig.stop_loss}")
+        return {"success": True, "qty": target_qty, "stop_loss": sig.stop_loss}
     
     return {"success": False, "msg": f"未知動作: {action}"}
 
-# 🚀 啟動時自動測試幣安連線與金鑰
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -231,7 +259,7 @@ async def startup_event():
         equity = client.get_equity()
         logger.info(f"✅ 幣安 API 連線成功！當前帳戶保證金餘額 (Equity): {equity} USDT")
     except Exception as e:
-        logger.error(f"❌ 幣安 API 連線失敗！請檢查你的 API Key / Secret 是否正確，或是否有開通期貨權限。錯誤: {e}")
+        logger.error(f"❌ 幣安 API 連線失敗！錯誤: {e}")
 
 if __name__ == "__main__":
     import uvicorn
