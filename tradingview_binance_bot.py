@@ -119,22 +119,23 @@ class BinanceClient:
         p["signature"] = self._sign(p)
         return self._safe_request("POST", "/fapi/v1/order", data=p)
 
-    def set_sl(self, sym: str, side: str, price: float):
-        # 🛠️ 修正為合約支援的標準 STOP_MARKET 參數格式
+    def set_sl(self, sym: str, side: str, price: float, qty: float):
+        # 🛠️ 修正止損參數：明確指定數量與價格，避免 closePosition 在某些帳戶模式下報錯
         p = {
             "symbol": sym.upper(), 
             "side": side.upper(), 
             "type": "STOP_MARKET", 
             "stopPrice": round(price, 2),
+            "quantity": qty,
+            "reduceOnly": "true",
             "workingType": "CONTRACT_PRICE",
-            "closePosition": "true", 
             "timestamp": int(time.time() * 1000) + self.time_offset
         }
         p["signature"] = self._sign(p)
         res = self._safe_request("POST", "/fapi/v1/order", data=p)
         
         if isinstance(res, dict) and "orderId" in res:
-            logger.info(f"✅ 強制止損單掛單成功！價格: {price}, 訂單ID: {res.get('orderId')}")
+            logger.info(f"✅ 止損單掛單成功！價格: {price}, 數量: {qty}, 訂單ID: {res.get('orderId')}")
             return True
         else:
             logger.error(f"❌ 幣安拒絕止損單！完整回應: {res}")
@@ -204,7 +205,7 @@ async def handle_webhook(request: Request):
             client.cancel_all(sym)
             entry_p = trade_memory.get(sym, {}).get("entry_p")
             if entry_p:
-                client.set_sl(sym, side, entry_p)
+                client.set_sl(sym, side, entry_p, pos * 0.5)
             return {"success": True, "msg": "TP1已達成：平倉50%並保本"}
 
     if action in ("CLOSE_LONG", "CLOSE_SHORT"):
@@ -239,10 +240,10 @@ async def handle_webhook(request: Request):
             logger.error(f"❌ 開倉失敗: {order_res}")
             raise HTTPException(status_code=400, detail="幣安拒絕開倉")
 
-        # 2. 🛡️ 掛上止損單
-        sl_success = client.set_sl(sym, sl_side, sig.stop_loss)
+        # 2. 🛡️ 掛上止損單（帶有數量與 reduceOnly）
+        sl_success = client.set_sl(sym, sl_side, sig.stop_loss, target_qty)
         
-        # 3. 如果止損單掛單失敗，為了防止爆倉，立即發起緊急平倉！
+        # 3. 如果止損單掛單失敗，立即執行緊急平倉保護，防止裸奔
         if not sl_success:
             logger.critical(f"🚨 嚴重警告：止損單掛單失敗！為了防止爆倉，正在執行緊急市價平倉...")
             client.order(sym, sl_side, target_qty, reduce_only=True)
