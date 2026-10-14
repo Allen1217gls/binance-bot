@@ -1,10 +1,40 @@
+import os
+import time
+import math
+import hmac
+import hashlib
+import logging
+import secrets
+from typing import Optional, Dict, Any, Tuple
+from urllib.parse import urlencode
+
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("ADX_SuperTrend_Bot")
+
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "Apple")
+USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() in ("true", "1", "yes")
+FUTURES_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
+
 class BinanceClient:
     def __init__(self, key: str, sec: str):
         self.key, self.sec = key, sec
         self.time_offset = 0
         self._precisions: Dict[str, Tuple[float, int]] = {}
-        self._sync()
-        self._load_exchange_info()  # 👈 改成在初始化時一次載入所有交易規則，避免頻繁打 API
+        
+        # 🛡️ 加上容錯保護：就算開機時網路不好或 IP 被封鎖，程式也不會崩潰閃退
+        try:
+            self._sync()
+            self._load_exchange_info()
+        except Exception as e:
+            logger.warning(f"啟動時初始化連線失敗（可能 IP 仍被封鎖中），將繼續運行: {e}")
 
     def _sync(self):
         try:
@@ -14,7 +44,7 @@ class BinanceClient:
             self.time_offset = 0
 
     def _load_exchange_info(self):
-        """ ✅ 啟動時一次抓取所有幣別的精度，保護 API 權重 """
+        """ 啟動時一次抓取所有幣別的精度，避免頻繁打 API 造成 IP 被封 """
         try:
             res = requests.get(f"{FUTURES_URL}/fapi/v1/exchangeInfo", timeout=10).json()
             for s in res.get("symbols", []):
@@ -45,7 +75,19 @@ class BinanceClient:
 
     def format_qty(self, sym: str, raw_qty: float) -> float:
         sym = sym.upper()
-        # 👈 直接從記憶體字典拿資料，不再發送 requests 請求
+        # 如果記憶體中沒有，現場補抓一次防呆
+        if sym not in self._precisions:
+            try:
+                res = requests.get(f"{FUTURES_URL}/fapi/v1/exchangeInfo").json()
+                for s in res.get("symbols", []):
+                    if s.get("symbol") == sym:
+                        for f in s.get("filters", []):
+                            if f.get("filterType") == "LOT_SIZE":
+                                step = float(f.get("stepSize", "0.001"))
+                                dec = max(0, -int(math.log10(step))) if step < 1 else 0
+                                self._precisions[sym] = (step, dec)
+            except Exception:
+                self._precisions[sym] = (0.001, 3)
         step, dec = self._precisions.get(sym, (0.001, 3))
         return round(math.floor(raw_qty / step) * step, dec)
 
@@ -79,3 +121,76 @@ class BinanceClient:
             if pos.get("symbol") == sym.upper():
                 return abs(float(pos.get("positionAmt", 0.0)))
         return 0.0
+
+app = FastAPI()
+client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
+trade_memory: Dict[str, Dict[str, Any]] = {}
+
+class Signal(BaseModel):
+    passphrase: str
+    symbol: str
+    action: str
+    risk_pct: Optional[float] = 2.0
+    stop_loss: Optional[float] = None
+    leverage: Optional[int] = 10
+
+@app.get("/")
+def index():
+    return {"status": "online", "feature": "2% Risk Auto-Sizing & SuperTrend Bot"}
+
+@app.post("/webhook")
+async def handle_webhook(sig: Signal):
+    if not secrets.compare_digest(sig.passphrase, WEBHOOK_PASSPHRASE):
+        raise HTTPException(status_code=401, detail="密碼錯誤")
+
+    sym, action = sig.symbol.upper(), sig.action.upper()
+    if sig.leverage:
+        client.set_leverage(sym, sig.leverage)
+
+    # 1. TP1 達到 1.5R 盈虧比：平倉 50% ＋ 止損移至進場價保本
+    if action in ("TP1_LONG", "TP1_SHORT"):
+        pos = client.get_pos(sym)
+        if pos > 0:
+            side = "SELL" if "LONG" in action else "BUY"
+            client.order(sym, side, client.format_qty(sym, pos * 0.5), reduce_only=True)
+            client.cancel_all(sym)
+            entry_p = trade_memory.get(sym, {}).get("entry_p")
+            if entry_p:
+                client.set_sl(sym, side, entry_p)
+            return {"success": True, "msg": "TP1已達成：平倉50%並推移至成本價保本"}
+
+    # 2. 趨勢反轉（翻紅或翻綠）：市價全平剩餘倉位
+    if action in ("CLOSE_LONG", "CLOSE_SHORT"):
+        client.cancel_all(sym)
+        pos = client.get_pos(sym)
+        if pos > 0:
+            side = "SELL" if "LONG" in action else "BUY"
+            client.order(sym, side, pos, reduce_only=True)
+            trade_memory.pop(sym, None)
+            return {"success": True, "msg": "趨勢反轉：全倉平倉出場"}
+
+    # 3. 進場開倉：根據「本金 2% 風險」結合「止損距離」自動反算下單顆數
+    if action in ("LONG", "SHORT"):
+        if not sig.stop_loss:
+            raise HTTPException(status_code=400, detail="必須附帶止損價格")
+        equity = client.get_equity()
+        curr_p = client.get_price(sym)
+        risk_usd = equity * ((sig.risk_pct or 2.0) / 100.0)
+        dist = abs(curr_p - sig.stop_loss)
+        if dist <= 0:
+            raise HTTPException(status_code=400, detail="止損距離為0")
+        
+        target_qty = client.format_qty(sym, risk_usd / dist)
+        if target_qty <= 0:
+            raise HTTPException(status_code=400, detail="計算倉位低於最小下單量")
+
+        side = "BUY" if action == "LONG" else "SELL"
+        client.order(sym, side, target_qty)
+        client.set_sl(sym, "SELL" if side == "BUY" else "BUY", sig.stop_loss)
+        trade_memory[sym] = {"entry_p": curr_p, "qty": target_qty}
+        logger.info(f"開單成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 止損距離={dist:.2f}, 下單顆數={target_qty}{sym}")
+        return {"success": True, "qty": target_qty, "equity": equity, "risk_usd": risk_usd}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
