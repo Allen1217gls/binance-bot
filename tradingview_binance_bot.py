@@ -63,7 +63,6 @@ class BinanceClient:
         return {"X-MBX-APIKEY": self.key, "Content-Type": "application/x-www-form-urlencoded"}
 
     def _safe_request(self, method: str, endpoint: str, params: dict = None, data: dict = None, retries: int = 3) -> Any:
-        """ 🛡️ 帶有自動重試與防頻率限制（Rate Limit）保護的請求包裝器 """
         url = f"{FUTURES_URL}{endpoint}"
         for attempt in range(retries):
             try:
@@ -74,10 +73,9 @@ class BinanceClient:
                 
                 data_json = res.json()
                 
-                # 檢查是否觸發幣安頻率限制 (-1003 或 IP 封鎖)
                 if isinstance(data_json, dict) and data_json.get("code") == -1003:
                     logger.warning(f"觸發幣安頻率限制 (-1003)，正在進行第 {attempt+1} 次重試...")
-                    time.sleep(3 * (attempt + 1)) # 遞增等待時間
+                    time.sleep(3 * (attempt + 1))
                     continue
                 return data_json
             except Exception as e:
@@ -224,6 +222,16 @@ async def handle_webhook(request: Request):
         return {"success": True, "qty": target_qty}
     
     return {"success": False, "msg": f"未知動作: {action}"}
+
+# 🚀 啟動時自動測試幣安連線與金鑰
+@app.on_event("startup")
+async def startup_event():
+    try:
+        logger.info("正在測試連接幣安期貨 API...")
+        equity = client.get_equity()
+        logger.info(f"✅ 幣安 API 連線成功！當前帳戶保證金餘額 (Equity): {equity} USDT")
+    except Exception as e:
+        logger.error(f"❌ 幣安 API 連線失敗！請檢查你的 API Key / Secret 是否正確，或是否有開通期貨權限。錯誤: {e}")
 
 if __name__ == "__main__":
     import uvicorn
