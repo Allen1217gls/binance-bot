@@ -33,7 +33,7 @@ class BinanceClient:
             self._sync()
             self._load_exchange_info()
         except Exception as e:
-            logger.warning(f"啟動時初始化連線失敗（可能 IP 仍被封鎖中），將繼續運行: {e}")
+            logger.warning(f"啟動時初始化連線失敗: {e}")
 
     def _sync(self):
         try:
@@ -52,7 +52,7 @@ class BinanceClient:
                         step = float(f.get("stepSize", "0.001"))
                         dec = max(0, -int(math.log10(step))) if step < 1 else 0
                         self._precisions[sym] = (step, dec)
-            logger.info("已成功預先載入所有交易對的精度資訊，節省 API 權重。")
+            logger.info("已成功預先載入所有交易對的精度資訊。")
         except Exception as e:
             logger.error(f"載入 exchangeInfo 失敗: {e}")
 
@@ -62,67 +62,87 @@ class BinanceClient:
     def _headers(self):
         return {"X-MBX-APIKEY": self.key, "Content-Type": "application/x-www-form-urlencoded"}
 
+    def _safe_request(self, method: str, endpoint: str, params: dict = None, data: dict = None, retries: int = 3) -> Any:
+        """ 🛡️ 帶有自動重試與防頻率限制（Rate Limit）保護的請求包裝器 """
+        url = f"{FUTURES_URL}{endpoint}"
+        for attempt in range(retries):
+            try:
+                if method == "GET":
+                    res = requests.get(url, headers=self._headers(), params=params, timeout=10)
+                else:
+                    res = requests.post(url, headers=self._headers(), data=data, timeout=10)
+                
+                data_json = res.json()
+                
+                # 檢查是否觸發幣安頻率限制 (-1003 或 IP 封鎖)
+                if isinstance(data_json, dict) and data_json.get("code") == -1003:
+                    logger.warning(f"觸發幣安頻率限制 (-1003)，正在進行第 {attempt+1} 次重試...")
+                    time.sleep(3 * (attempt + 1)) # 遞增等待時間
+                    continue
+                return data_json
+            except Exception as e:
+                logger.error(f"API 請求異常 (嘗試 {attempt+1}/{retries}): {e}")
+                if attempt == retries - 1:
+                    return None
+                time.sleep(2)
+        return None
+
     def get_equity(self) -> float:
         p = {"timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 5000}
         p["signature"] = self._sign(p)
-        res = requests.get(f"{FUTURES_URL}/fapi/v2/account", headers=self._headers(), params=p, timeout=10).json()
-        return float(res.get("totalMarginBalance", res.get("availableBalance", 0.0)))
+        res = self._safe_request("GET", "/fapi/v2/account", params=p)
+        if isinstance(res, dict):
+            return float(res.get("totalMarginBalance", res.get("availableBalance", 0.0)))
+        return 0.0
 
     def get_price(self, sym: str) -> float:
-        return float(requests.get(f"{FUTURES_URL}/fapi/v1/ticker/price", params={"symbol": sym.upper()}).json().get("price", 0.0))
+        try:
+            res = requests.get(f"{FUTURES_URL}/fapi/v1/ticker/price", params={"symbol": sym.upper()}, timeout=5).json()
+            return float(res.get("price", 0.0))
+        except Exception:
+            return 0.0
 
     def format_qty(self, sym: str, raw_qty: float) -> float:
         sym = sym.upper()
         if sym not in self._precisions:
-            try:
-                res = requests.get(f"{FUTURES_URL}/fapi/v1/exchangeInfo").json()
-                for s in res.get("symbols", []):
-                    if s.get("symbol") == sym:
-                        for f in s.get("filters", []):
-                            if f.get("filterType") == "LOT_SIZE":
-                                step = float(f.get("stepSize", "0.001"))
-                                dec = max(0, -int(math.log10(step))) if step < 1 else 0
-                                self._precisions[sym] = (step, dec)
-            except Exception:
-                self._precisions[sym] = (0.001, 3)
+            self._load_exchange_info()
         step, dec = self._precisions.get(sym, (0.001, 3))
         return round(math.floor(raw_qty / step) * step, dec)
 
     def set_leverage(self, sym: str, lev: int):
         p = {"symbol": sym.upper(), "leverage": lev, "timestamp": int(time.time() * 1000) + self.time_offset}
         p["signature"] = self._sign(p)
-        requests.post(f"{FUTURES_URL}/fapi/v1/leverage", headers=self._headers(), data=p)
+        self._safe_request("POST", "/fapi/v1/leverage", data=p)
 
     def order(self, sym: str, side: str, qty: float, reduce_only: bool = False):
         p = {"symbol": sym.upper(), "side": side.upper(), "type": "MARKET", "quantity": qty, "timestamp": int(time.time() * 1000) + self.time_offset}
         if reduce_only:
             p["reduceOnly"] = "true"
         p["signature"] = self._sign(p)
-        return requests.post(f"{FUTURES_URL}/fapi/v1/order", headers=self._headers(), data=p).json()
+        return self._safe_request("POST", "/fapi/v1/order", data=p)
 
     def set_sl(self, sym: str, side: str, price: float):
         p = {"symbol": sym.upper(), "side": side.upper(), "type": "STOP_MARKET", "stopPrice": round(price, 2), "closePosition": "true", "timestamp": int(time.time() * 1000) + self.time_offset}
         p["signature"] = self._sign(p)
-        return requests.post(f"{FUTURES_URL}/fapi/v1/order", headers=self._headers(), data=p).json()
+        return self._safe_request("POST", "/fapi/v1/order", data=p)
 
     def cancel_all(self, sym: str):
         p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
         p["signature"] = self._sign(p)
-        return requests.delete(f"{FUTURES_URL}/fapi/v1/allOpenOrders", headers=self._headers(), data=p).json()
+        url = f"{FUTURES_URL}/fapi/v1/allOpenOrders"
+        try:
+            return requests.delete(url, headers=self._headers(), data=p, timeout=5).json()
+        except Exception:
+            return {}
 
     def get_pos(self, sym: str) -> float:
         p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
         p["signature"] = self._sign(p)
-        try:
-            res = requests.get(f"{FUTURES_URL}/fapi/v2/positionRisk", headers=self._headers(), params=p).json()
-            if isinstance(res, list):
-                for pos in res:
-                    if pos.get("symbol") == sym.upper():
-                        return abs(float(pos.get("positionAmt", 0.0)))
-            else:
-                logger.warning(f"取得持倉 API 回傳非預期格式: {res}")
-        except Exception as e:
-            logger.error(f"取得持倉發生錯誤: {e}")
+        res = self._safe_request("GET", "/fapi/v2/positionRisk", params=p)
+        if isinstance(res, list):
+            for pos in res:
+                if pos.get("symbol") == sym.upper():
+                    return abs(float(pos.get("positionAmt", 0.0)))
         return 0.0
 
 app = FastAPI()
@@ -139,15 +159,11 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "2% Risk Auto-Sizing & SuperTrend Bot"}
+    return {"status": "online", "feature": "Optimized Rate-Limit Protected Bot"}
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     try:
-        body_bytes = await request.body()
-        body_str = body_bytes.decode("utf-8")
-        logger.info(f"收到來自 TradingView 的原始訊息: {body_str}")
-        
         data = await request.json()
     except Exception as e:
         logger.error(f"解析 JSON 失敗: {e}")
@@ -156,7 +172,7 @@ async def handle_webhook(request: Request):
     try:
         sig = Signal(**data)
     except Exception as e:
-        logger.error(f"Pydantic 模型驗證失敗: {e}, 收到數據為: {data}")
+        logger.error(f"Pydantic 模型驗證失敗: {e}")
         raise HTTPException(status_code=400, detail=f"Validation Error: {e}")
 
     if not secrets.compare_digest(sig.passphrase, WEBHOOK_PASSPHRASE):
@@ -175,7 +191,7 @@ async def handle_webhook(request: Request):
             entry_p = trade_memory.get(sym, {}).get("entry_p")
             if entry_p:
                 client.set_sl(sym, side, entry_p)
-            return {"success": True, "msg": "TP1已達成：平倉50%並推移至成本價保本"}
+            return {"success": True, "msg": "TP1已達成：平倉50%並保本"}
 
     if action in ("CLOSE_LONG", "CLOSE_SHORT"):
         client.cancel_all(sym)
@@ -184,7 +200,7 @@ async def handle_webhook(request: Request):
             side = "SELL" if "LONG" in action else "BUY"
             client.order(sym, side, pos, reduce_only=True)
             trade_memory.pop(sym, None)
-            return {"success": True, "msg": "趨勢反轉：全倉平倉出場"}
+            return {"success": True, "msg": "趨勢反轉：全平倉"}
 
     if action in ("LONG", "SHORT"):
         if not sig.stop_loss:
@@ -204,8 +220,8 @@ async def handle_webhook(request: Request):
         client.order(sym, side, target_qty)
         client.set_sl(sym, "SELL" if side == "BUY" else "BUY", sig.stop_loss)
         trade_memory[sym] = {"entry_p": curr_p, "qty": target_qty}
-        logger.info(f"開單成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 止損距離={dist:.2f}, 下單顆數={target_qty}{sym}")
-        return {"success": True, "qty": target_qty, "equity": equity, "risk_usd": risk_usd}
+        logger.info(f"開單成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 下單顆數={target_qty}{sym}")
+        return {"success": True, "qty": target_qty}
     
     return {"success": False, "msg": f"未知動作: {action}"}
 
