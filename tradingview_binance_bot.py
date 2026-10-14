@@ -29,7 +29,6 @@ class BinanceClient:
         self.time_offset = 0
         self._precisions: Dict[str, Tuple[float, int]] = {}
         
-        # 🛡️ 加上容錯保護：就算開機時網路不好或 IP 被封鎖，程式也不會崩潰閃退
         try:
             self._sync()
             self._load_exchange_info()
@@ -44,7 +43,6 @@ class BinanceClient:
             self.time_offset = 0
 
     def _load_exchange_info(self):
-        """ 啟動時一次抓取所有幣別的精度，避免頻繁打 API 造成 IP 被封 """
         try:
             res = requests.get(f"{FUTURES_URL}/fapi/v1/exchangeInfo", timeout=10).json()
             for s in res.get("symbols", []):
@@ -117,7 +115,6 @@ class BinanceClient:
         p["signature"] = self._sign(p)
         try:
             res = requests.get(f"{FUTURES_URL}/fapi/v2/positionRisk", headers=self._headers(), params=p).json()
-            # 🛡️ 加上防呆防崩潰保護：確保回傳的是 list 才跑迴圈
             if isinstance(res, list):
                 for pos in res:
                     if pos.get("symbol") == sym.upper():
@@ -145,7 +142,23 @@ def index():
     return {"status": "online", "feature": "2% Risk Auto-Sizing & SuperTrend Bot"}
 
 @app.post("/webhook")
-async def handle_webhook(sig: Signal):
+async def handle_webhook(request: Request):
+    try:
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8")
+        logger.info(f"收到來自 TradingView 的原始訊息: {body_str}")
+        
+        data = await request.json()
+    except Exception as e:
+        logger.error(f"解析 JSON 失敗: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    try:
+        sig = Signal(**data)
+    except Exception as e:
+        logger.error(f"Pydantic 模型驗證失敗: {e}, 收到數據為: {data}")
+        raise HTTPException(status_code=400, detail=f"Validation Error: {e}")
+
     if not secrets.compare_digest(sig.passphrase, WEBHOOK_PASSPHRASE):
         raise HTTPException(status_code=401, detail="密碼錯誤")
 
@@ -153,7 +166,6 @@ async def handle_webhook(sig: Signal):
     if sig.leverage:
         client.set_leverage(sym, sig.leverage)
 
-    # 1. TP1 達到盈虧比目標：平倉 50% ＋ 止損移至進場價保本
     if action in ("TP1_LONG", "TP1_SHORT"):
         pos = client.get_pos(sym)
         if pos > 0:
@@ -165,7 +177,6 @@ async def handle_webhook(sig: Signal):
                 client.set_sl(sym, side, entry_p)
             return {"success": True, "msg": "TP1已達成：平倉50%並推移至成本價保本"}
 
-    # 2. 趨勢反轉（翻紅或翻綠）：市價全平剩餘倉位
     if action in ("CLOSE_LONG", "CLOSE_SHORT"):
         client.cancel_all(sym)
         pos = client.get_pos(sym)
@@ -175,7 +186,6 @@ async def handle_webhook(sig: Signal):
             trade_memory.pop(sym, None)
             return {"success": True, "msg": "趨勢反轉：全倉平倉出場"}
 
-    # 3. 進場開倉：根據「本金 2% 風險」結合「止損距離」自動反算下單顆數
     if action in ("LONG", "SHORT"):
         if not sig.stop_loss:
             raise HTTPException(status_code=400, detail="必須附帶止損價格")
@@ -196,6 +206,8 @@ async def handle_webhook(sig: Signal):
         trade_memory[sym] = {"entry_p": curr_p, "qty": target_qty}
         logger.info(f"開單成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 止損距離={dist:.2f}, 下單顆數={target_qty}{sym}")
         return {"success": True, "qty": target_qty, "equity": equity, "risk_usd": risk_usd}
+    
+    return {"success": False, "msg": f"未知動作: {action}"}
 
 if __name__ == "__main__":
     import uvicorn
