@@ -1,202 +1,174 @@
 import os
 import time
+import math
 import hmac
 import hashlib
 import logging
 import secrets
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
 
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("TradingViewBinanceBot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("ADX_SuperTrend_Bot")
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "CHANGE_ME_IN_ENV")
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "Apple")
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() in ("true", "1", "yes")
-
-SPOT_BASE_URL = "https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
-FUTURES_BASE_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
+FUTURES_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
 
 class BinanceClient:
-    def __init__(self, api_key: str, api_secret: str, use_testnet: bool = False):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.use_testnet = use_testnet
-        self.spot_url = SPOT_BASE_URL
-        self.futures_url = FUTURES_BASE_URL
+    def __init__(self, key: str, sec: str):
+        self.key, self.sec = key, sec
         self.time_offset = 0
-        self._sync_time()
+        self._precisions: Dict[str, Tuple[float, int]] = {}
+        self._sync()
 
-    def _sync_time(self):
+    def _sync(self):
         try:
-            res = requests.get(f"{self.spot_url}/api/v3/time", timeout=5)
-            if res.status_code == 200:
-                server_time = res.json().get("serverTime", int(time.time() * 1000))
-                local_time = int(time.time() * 1000)
-                self.time_offset = server_time - local_time
-                logger.info(f"Server time synced. Offset: {self.time_offset}ms")
-        except Exception as e:
-            logger.warning(f"Failed to sync time: {e}")
+            res = requests.get(f"{FUTURES_URL}/fapi/v1/time", timeout=5).json()
+            self.time_offset = res.get("serverTime", int(time.time() * 1000)) - int(time.time() * 1000)
+        except Exception:
             self.time_offset = 0
 
-    def _get_timestamp(self) -> int:
-        return int(time.time() * 1000) + self.time_offset
+    def _sign(self, p: Dict[str, Any]) -> str:
+        return hmac.new(self.sec.encode(), urlencode(p).encode(), hashlib.sha256).hexdigest()
 
-    def _sign(self, params: Dict[str, Any]) -> str:
-        query_string = urlencode(params)
-        return hmac.new(
-            self.api_secret.encode("utf-8"),
-            query_string.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+    def _headers(self):
+        return {"X-MBX-APIKEY": self.key, "Content-Type": "application/x-www-form-urlencoded"}
 
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "X-MBX-APIKEY": self.api_key,
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
+    def get_equity(self) -> float:
+        p = {"timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 5000}
+        p["signature"] = self._sign(p)
+        res = requests.get(f"{FUTURES_URL}/fapi/v2/account", headers=self._headers(), params=p, timeout=10).json()
+        return float(res.get("totalMarginBalance", res.get("availableBalance", 0.0)))
 
-    def place_spot_order(self, symbol: str, side: str, order_type: str = "MARKET",
-                         quantity: Optional[float] = None, quote_quantity: Optional[float] = None,
-                         price: Optional[float] = None) -> Dict[str, Any]:
-        endpoint = f"{self.spot_url}/api/v3/order"
-        params: Dict[str, Any] = {
-            "symbol": symbol.upper(),
-            "side": side.upper(),
-            "type": order_type.upper(),
-            "timestamp": self._get_timestamp(),
-            "recvWindow": 5000,
-        }
-        if order_type.upper() == "MARKET":
-            if quote_quantity is not None and side.upper() == "BUY":
-                params["quoteOrderQty"] = quote_quantity
-            elif quantity is not None:
-                params["quantity"] = quantity
-            else:
-                raise ValueError("Spot MARKET requires quantity or quote_quantity.")
-        elif order_type.upper() == "LIMIT":
-            params["quantity"] = quantity
-            params["price"] = price
-            params["timeInForce"] = "GTC"
+    def get_price(self, sym: str) -> float:
+        return float(requests.get(f"{FUTURES_URL}/fapi/v1/ticker/price", params={"symbol": sym.upper()}).json().get("price", 0.0))
 
-        params["signature"] = self._sign(params)
-        resp = requests.post(endpoint, headers=self._headers(), data=params, timeout=10)
-        data = resp.json()
-        if resp.status_code != 200:
-            raise HTTPException(status_code=400, detail=data)
-        return data
+    def format_qty(self, sym: str, raw_qty: float) -> float:
+        sym = sym.upper()
+        if sym not in self._precisions:
+            try:
+                res = requests.get(f"{FUTURES_URL}/fapi/v1/exchangeInfo").json()
+                for s in res.get("symbols", []):
+                    if s.get("symbol") == sym:
+                        for f in s.get("filters", []):
+                            if f.get("filterType") == "LOT_SIZE":
+                                step = float(f.get("stepSize", "0.001"))
+                                dec = max(0, -int(math.log10(step))) if step < 1 else 0
+                                self._precisions[sym] = (step, dec)
+            except Exception:
+                self._precisions[sym] = (0.001, 3)
+        step, dec = self._precisions.get(sym, (0.001, 3))
+        return round(math.floor(raw_qty / step) * step, dec)
 
-    def set_futures_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        endpoint = f"{self.futures_url}/fapi/v1/leverage"
-        params = {
-            "symbol": symbol.upper(),
-            "leverage": leverage,
-            "timestamp": self._get_timestamp(),
-            "recvWindow": 5000,
-        }
-        params["signature"] = self._sign(params)
-        return requests.post(endpoint, headers=self._headers(), data=params, timeout=10).json()
+    def set_leverage(self, sym: str, lev: int):
+        p = {"symbol": sym.upper(), "leverage": lev, "timestamp": int(time.time() * 1000) + self.time_offset}
+        p["signature"] = self._sign(p)
+        requests.post(f"{FUTURES_URL}/fapi/v1/leverage", headers=self._headers(), data=p)
 
-    def place_futures_order(self, symbol: str, side: str, order_type: str = "MARKET",
-                            quantity: Optional[float] = None, price: Optional[float] = None,
-                            reduce_only: bool = False) -> Dict[str, Any]:
-        endpoint = f"{self.futures_url}/fapi/v1/order"
-        params: Dict[str, Any] = {
-            "symbol": symbol.upper(),
-            "side": side.upper(),
-            "type": order_type.upper(),
-            "timestamp": self._get_timestamp(),
-            "recvWindow": 5000,
-        }
+    def order(self, sym: str, side: str, qty: float, reduce_only: bool = False):
+        p = {"symbol": sym.upper(), "side": side.upper(), "type": "MARKET", "quantity": qty, "timestamp": int(time.time() * 1000) + self.time_offset}
         if reduce_only:
-            params["reduceOnly"] = "true"
-        if order_type.upper() == "MARKET":
-            params["quantity"] = quantity
-        elif order_type.upper() == "LIMIT":
-            params["quantity"] = quantity
-            params["price"] = price
-            params["timeInForce"] = "GTC"
+            p["reduceOnly"] = "true"
+        p["signature"] = self._sign(p)
+        return requests.post(f"{FUTURES_URL}/fapi/v1/order", headers=self._headers(), data=p).json()
 
-        params["signature"] = self._sign(params)
-        resp = requests.post(endpoint, headers=self._headers(), data=params, timeout=10)
-        data = resp.json()
-        if resp.status_code != 200:
-            raise HTTPException(status_code=400, detail=data)
-        return data
+    def set_sl(self, sym: str, side: str, price: float):
+        p = {"symbol": sym.upper(), "side": side.upper(), "type": "STOP_MARKET", "stopPrice": round(price, 2), "closePosition": "true", "timestamp": int(time.time() * 1000) + self.time_offset}
+        p["signature"] = self._sign(p)
+        return requests.post(f"{FUTURES_URL}/fapi/v1/order", headers=self._headers(), data=p).json()
 
-class TradingViewSignal(BaseModel):
+    def cancel_all(self, sym: str):
+        p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
+        p["signature"] = self._sign(p)
+        return requests.delete(f"{FUTURES_URL}/fapi/v1/allOpenOrders", headers=self._headers(), data=p).json()
+
+    def get_pos(self, sym: str) -> float:
+        p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
+        p["signature"] = self._sign(p)
+        res = requests.get(f"{FUTURES_URL}/fapi/v2/positionRisk", headers=self._headers(), params=p).json()
+        for pos in res:
+            if pos.get("symbol") == sym.upper():
+                return abs(float(pos.get("positionAmt", 0.0)))
+        return 0.0
+
+app = FastAPI()
+client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
+trade_memory: Dict[str, Dict[str, Any]] = {}
+
+class Signal(BaseModel):
     passphrase: str
     symbol: str
     action: str
-    market_type: str = "spot"
-    order_type: str = "MARKET"
-    quantity: Optional[float] = None
-    quote_quantity: Optional[float] = None
-    price: Optional[float] = None
-    leverage: Optional[int] = None
-    reduce_only: Optional[bool] = False
-
-app = FastAPI(title="TradingView Binance Bot")
-binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET, USE_TESTNET)
+    risk_pct: Optional[float] = 2.0
+    stop_loss: Optional[float] = None
+    leverage: Optional[int] = 10
 
 @app.get("/")
 def index():
-    return {"status": "online", "service": "TradingView Binance Webhook Bot"}
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "timestamp": int(time.time())}
+    return {"status": "online", "feature": "2% Risk Auto-Sizing & SuperTrend Bot"}
 
 @app.post("/webhook")
-async def handle_webhook(signal: TradingViewSignal, request: Request):
-    if not secrets.compare_digest(signal.passphrase, WEBHOOK_PASSPHRASE):
-        raise HTTPException(status_code=401, detail="Invalid passphrase")
+async def handle_webhook(sig: Signal):
+    if not secrets.compare_digest(sig.passphrase, WEBHOOK_PASSPHRASE):
+        raise HTTPException(status_code=401, detail="密碼錯誤")
 
-    action = signal.action.upper()
-    market = signal.market_type.lower()
-    symbol = signal.symbol.upper()
+    sym, action = sig.symbol.upper(), sig.action.upper()
+    if sig.leverage:
+        client.set_leverage(sym, sig.leverage)
 
-    if market == "spot":
-        if action in ("BUY", "LONG"):
-            res = binance_client.place_spot_order(symbol, "BUY", signal.order_type, signal.quantity, signal.quote_quantity, signal.price)
-        elif action in ("SELL", "SHORT", "CLOSE"):
-            res = binance_client.place_spot_order(symbol, "SELL", signal.order_type, signal.quantity, None, signal.price)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
-    elif market in ("futures", "future", "usdm"):
-        if signal.leverage:
-            try:
-                binance_client.set_futures_leverage(symbol, signal.leverage)
-            except Exception:
-                pass
-        if action in ("BUY", "LONG"):
-            res = binance_client.place_futures_order(symbol, "BUY", signal.order_type, signal.quantity, signal.price, signal.reduce_only or False)
-        elif action in ("SELL", "SHORT"):
-            res = binance_client.place_futures_order(symbol, "SELL", signal.order_type, signal.quantity, signal.price, signal.reduce_only or False)
-        elif action in ("CLOSE_LONG", "CLOSE_BUY"):
-            res = binance_client.place_futures_order(symbol, "SELL", signal.order_type, signal.quantity, signal.price, reduce_only=True)
-        elif action in ("CLOSE_SHORT", "CLOSE_SELL"):
-            res = binance_client.place_futures_order(symbol, "BUY", signal.order_type, signal.quantity, signal.price, reduce_only=True)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
-    else:
-        raise HTTPException(status_code=400, detail="Invalid market_type")
+    # 1. TP1 達到 1.5R 盈虧比：平倉 50% ＋ 止損移至進場價保本
+    if action in ("TP1_LONG", "TP1_SHORT"):
+        pos = client.get_pos(sym)
+        if pos > 0:
+            side = "SELL" if "LONG" in action else "BUY"
+            client.order(sym, side, client.format_qty(sym, pos * 0.5), reduce_only=True)
+            client.cancel_all(sym)
+            entry_p = trade_memory.get(sym, {}).get("entry_p")
+            if entry_p:
+                client.set_sl(sym, side, entry_p)
+            return {"success": True, "msg": "TP1已達成：平倉50%並推移至成本價保本"}
 
-    return {"success": True, "order_id": res.get("orderId"), "status": res.get("status")}
+    # 2. 趨勢反轉（翻紅或翻綠）：市價全平剩餘倉位
+    if action in ("CLOSE_LONG", "CLOSE_SHORT"):
+        client.cancel_all(sym)
+        pos = client.get_pos(sym)
+        if pos > 0:
+            side = "SELL" if "LONG" in action else "BUY"
+            client.order(sym, side, pos, reduce_only=True)
+            trade_memory.pop(sym, None)
+            return {"success": True, "msg": "趨勢反轉：全倉平倉出場"}
+
+    # 3. 進場開倉：根據「本金 2% 風險」結合「止損距離」自動反算下單顆數
+    if action in ("LONG", "SHORT"):
+        if not sig.stop_loss:
+            raise HTTPException(status_code=400, detail="必須附帶止損價格")
+        equity = client.get_equity()
+        curr_p = client.get_price(sym)
+        risk_usd = equity * ((sig.risk_pct or 2.0) / 100.0)
+        dist = abs(curr_p - sig.stop_loss)
+        if dist <= 0:
+            raise HTTPException(status_code=400, detail="止損距離為0")
+        
+        target_qty = client.format_qty(sym, risk_usd / dist)
+        if target_qty <= 0:
+            raise HTTPException(status_code=400, detail="計算倉位低於最小下單量")
+
+        side = "BUY" if action == "LONG" else "SELL"
+        client.order(sym, side, target_qty)
+        client.set_sl(sym, "SELL" if side == "BUY" else "BUY", sig.stop_loss)
+        trade_memory[sym] = {"entry_p": curr_p, "qty": target_qty}
+        logger.info(f"開單成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 止損距離={dist:.2f}, 下單顆數={target_qty}{sym}")
+        return {"success": True, "qty": target_qty, "equity": equity, "risk_usd": risk_usd}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
