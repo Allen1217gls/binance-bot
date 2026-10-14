@@ -120,11 +120,13 @@ class BinanceClient:
         return self._safe_request("POST", "/fapi/v1/order", data=p)
 
     def set_sl(self, sym: str, side: str, price: float):
+        # 🛠️ 修正為合約支援的標準 STOP_MARKET 參數格式
         p = {
             "symbol": sym.upper(), 
             "side": side.upper(), 
             "type": "STOP_MARKET", 
-            "stopPrice": round(price, 2), 
+            "stopPrice": round(price, 2),
+            "workingType": "CONTRACT_PRICE",
             "closePosition": "true", 
             "timestamp": int(time.time() * 1000) + self.time_offset
         }
@@ -237,10 +239,10 @@ async def handle_webhook(request: Request):
             logger.error(f"❌ 開倉失敗: {order_res}")
             raise HTTPException(status_code=400, detail="幣安拒絕開倉")
 
-        # 2. 🛡️ 強制掛上止損單
+        # 2. 🛡️ 掛上止損單
         sl_success = client.set_sl(sym, sl_side, sig.stop_loss)
         
-        # 3. 如果止損單掛單失敗，為了防止裸奔爆倉，立即發起緊急平倉！
+        # 3. 如果止損單掛單失敗，為了防止爆倉，立即發起緊急平倉！
         if not sl_success:
             logger.critical(f"🚨 嚴重警告：止損單掛單失敗！為了防止爆倉，正在執行緊急市價平倉...")
             client.order(sym, sl_side, target_qty, reduce_only=True)
