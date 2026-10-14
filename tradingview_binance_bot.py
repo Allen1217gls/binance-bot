@@ -27,7 +27,8 @@ class BinanceClient:
     def __init__(self, key: str, sec: str):
         self.key, self.sec = key, sec
         self.time_offset = 0
-        self._precisions: Dict[str, Tuple[float, int]] = {}
+        self._precisions: Dict[str, Tuple[float, int, int]] = {}
+        self._leverage_cache: Dict[str, int] = {}
         
         try:
             self._sync()
@@ -47,12 +48,18 @@ class BinanceClient:
             res = requests.get(f"{FUTURES_URL}/fapi/v1/exchangeInfo", timeout=10).json()
             for s in res.get("symbols", []):
                 sym = s.get("symbol")
+                price_prec = int(s.get("pricePrecision", 2))
+                step, dec = 0.001, 3
                 for f in s.get("filters", []):
                     if f.get("filterType") == "LOT_SIZE":
                         step = float(f.get("stepSize", "0.001"))
                         dec = max(0, -int(math.log10(step))) if step < 1 else 0
-                        self._precisions[sym] = (step, dec)
-            logger.info("已成功預先載入所有交易對的精度資訊。")
+                    elif f.get("filterType") == "PRICE_FILTER":
+                        tick = float(f.get("tickSize", "0.01"))
+                        if tick < 1:
+                            price_prec = max(0, -int(math.log10(tick)))
+                self._precisions[sym] = (step, dec, price_prec)
+            logger.info("已成功預先載入所有交易對的數量與價格精度資訊。")
         except Exception as e:
             logger.error(f"載入 exchangeInfo 失敗: {e}")
 
@@ -68,6 +75,8 @@ class BinanceClient:
             try:
                 if method == "GET":
                     res = requests.get(url, headers=self._headers(), params=params, timeout=10)
+                elif method == "DELETE":
+                    res = requests.delete(url, headers=self._headers(), data=data, timeout=10)
                 else:
                     res = requests.post(url, headers=self._headers(), data=data, timeout=10)
                 
@@ -104,13 +113,26 @@ class BinanceClient:
         sym = sym.upper()
         if sym not in self._precisions:
             self._load_exchange_info()
-        step, dec = self._precisions.get(sym, (0.001, 3))
+        step, dec, _ = self._precisions.get(sym, (0.001, 3, 2))
         return round(math.floor(raw_qty / step) * step, dec)
 
+    def format_price(self, sym: str, raw_price: float) -> float:
+        sym = sym.upper()
+        if sym not in self._precisions:
+            self._load_exchange_info()
+        _, _, price_prec = self._precisions.get(sym, (0.001, 3, 2))
+        return round(raw_price, price_prec)
+
     def set_leverage(self, sym: str, lev: int):
-        p = {"symbol": sym.upper(), "leverage": lev, "timestamp": int(time.time() * 1000) + self.time_offset}
+        sym = sym.upper()
+        # 快取槓桿設定，避免每次收訊號都重複打 API 浪費額度
+        if self._leverage_cache.get(sym) == lev:
+            return
+        p = {"symbol": sym, "leverage": lev, "timestamp": int(time.time() * 1000) + self.time_offset}
         p["signature"] = self._sign(p)
-        self._safe_request("POST", "/fapi/v1/leverage", data=p)
+        res = self._safe_request("POST", "/fapi/v1/leverage", data=p)
+        if isinstance(res, dict) and res.get("leverage") == lev:
+            self._leverage_cache[sym] = lev
 
     def order(self, sym: str, side: str, qty: float, reduce_only: bool = False):
         p = {"symbol": sym.upper(), "side": side.upper(), "type": "MARKET", "quantity": qty, "timestamp": int(time.time() * 1000) + self.time_offset}
@@ -119,36 +141,40 @@ class BinanceClient:
         p["signature"] = self._sign(p)
         return self._safe_request("POST", "/fapi/v1/order", data=p)
 
-    def set_sl(self, sym: str, side: str, price: float, qty: float):
-        # 🛠️ 修正止損參數：明確指定數量與價格，避免 closePosition 在某些帳戶模式下報錯
+    def set_sl(self, sym: str, side: str, price: float):
+        # 🛠️ 完美適配幣安最新 /fapi/v1/algoOrder 規範：必須同時帶入 algoType="CONDITIONAL" 與 type="STOP_MARKET"
+        formatted_p = self.format_price(sym, price)
         p = {
+            "algoType": "CONDITIONAL",
             "symbol": sym.upper(), 
             "side": side.upper(), 
             "type": "STOP_MARKET", 
-            "stopPrice": round(price, 2),
-            "quantity": qty,
-            "reduceOnly": "true",
+            "triggerPrice": formatted_p,
+            "closePosition": "true",
             "workingType": "CONTRACT_PRICE",
             "timestamp": int(time.time() * 1000) + self.time_offset
         }
         p["signature"] = self._sign(p)
-        res = self._safe_request("POST", "/fapi/v1/order", data=p)
+        res = self._safe_request("POST", "/fapi/v1/algoOrder", data=p)
         
-        if isinstance(res, dict) and "orderId" in res:
-            logger.info(f"✅ 止損單掛單成功！價格: {price}, 數量: {qty}, 訂單ID: {res.get('orderId')}")
+        if isinstance(res, dict) and "algoId" in res:
+            logger.info(f"✅ Algo 強制止損單掛單成功！觸發價: {formatted_p}, 訂單ID: {res.get('algoId')}")
             return True
         else:
-            logger.error(f"❌ 幣安拒絕止損單！完整回應: {res}")
+            logger.error(f"❌ 幣安拒絕 Algo 止損單！完整回應: {res}")
             return False
 
     def cancel_all(self, sym: str):
-        p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
-        p["signature"] = self._sign(p)
-        url = f"{FUTURES_URL}/fapi/v1/allOpenOrders"
-        try:
-            return requests.delete(url, headers=self._headers(), data=p, timeout=5).json()
-        except Exception:
-            return {}
+        sym = sym.upper()
+        # 1. 撤銷所有一般掛單
+        p1 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset}
+        p1["signature"] = self._sign(p1)
+        self._safe_request("DELETE", "/fapi/v1/allOpenOrders", data=p1, retries=1)
+        
+        # 2. 撤銷所有 Algo 條件止損掛單
+        p2 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset}
+        p2["signature"] = self._sign(p2)
+        return self._safe_request("DELETE", "/fapi/v1/algoOpenOrders", data=p2, retries=1)
 
     def get_pos(self, sym: str) -> float:
         p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
@@ -174,7 +200,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Strict Stop-Loss Protected Bot"}
+    return {"status": "online", "feature": "Tokyo Algo Stop-Loss Protected Bot"}
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
@@ -194,8 +220,6 @@ async def handle_webhook(request: Request):
         raise HTTPException(status_code=401, detail="密碼錯誤")
 
     sym, action = sig.symbol.upper(), sig.action.upper()
-    if sig.leverage:
-        client.set_leverage(sym, sig.leverage)
 
     if action in ("TP1_LONG", "TP1_SHORT"):
         pos = client.get_pos(sym)
@@ -205,23 +229,31 @@ async def handle_webhook(request: Request):
             client.cancel_all(sym)
             entry_p = trade_memory.get(sym, {}).get("entry_p")
             if entry_p:
-                client.set_sl(sym, side, entry_p, pos * 0.5)
-            return {"success": True, "msg": "TP1已達成：平倉50%並保本"}
+                client.set_sl(sym, side, entry_p)
+            return {"success": True, "msg": "TP1已達成：平倉50%並移至保本價"}
+        return {"success": True, "msg": "目前無持倉，略過TP1"}
 
     if action in ("CLOSE_LONG", "CLOSE_SHORT"):
-        client.cancel_all(sym)
         pos = client.get_pos(sym)
         if pos > 0:
+            client.cancel_all(sym)
             side = "SELL" if "LONG" in action else "BUY"
             client.order(sym, side, pos, reduce_only=True)
             trade_memory.pop(sym, None)
             return {"success": True, "msg": "趨勢反轉：全平倉"}
+        return {"success": True, "msg": "目前無持倉，略過平倉"}
 
     if action in ("LONG", "SHORT"):
         if not sig.stop_loss:
             raise HTTPException(status_code=400, detail="必須附帶止損價格")
+        if sig.leverage:
+            client.set_leverage(sym, sig.leverage)
+
         equity = client.get_equity()
         curr_p = client.get_price(sym)
+        if equity <= 0 or curr_p <= 0:
+            raise HTTPException(status_code=400, detail="無法取得帳戶餘額或現價")
+
         risk_usd = equity * ((sig.risk_pct or 2.0) / 100.0)
         dist = abs(curr_p - sig.stop_loss)
         if dist <= 0:
@@ -234,18 +266,19 @@ async def handle_webhook(request: Request):
         side = "BUY" if action == "LONG" else "SELL"
         sl_side = "SELL" if side == "BUY" else "BUY"
 
-        # 1. 執行市價開單
+        # 1. 先清除舊的殘留止損單，再執行市價開單
+        client.cancel_all(sym)
         order_res = client.order(sym, side, target_qty)
         if not isinstance(order_res, dict) or "orderId" not in order_res:
             logger.error(f"❌ 開倉失敗: {order_res}")
-            raise HTTPException(status_code=400, detail="幣安拒絕開倉")
+            raise HTTPException(status_code=400, detail=f"幣安拒絕開倉: {order_res}")
 
-        # 2. 🛡️ 掛上止損單（帶有數量與 reduceOnly）
-        sl_success = client.set_sl(sym, sl_side, sig.stop_loss, target_qty)
+        # 2. 🛡️ 掛上 Algo 強制止損單
+        sl_success = client.set_sl(sym, sl_side, sig.stop_loss)
         
-        # 3. 如果止損單掛單失敗，立即執行緊急平倉保護，防止裸奔
+        # 3. 如果止損單掛單失敗，立即執行緊急平倉保護
         if not sl_success:
-            logger.critical(f"🚨 嚴重警告：止損單掛單失敗！為了防止爆倉，正在執行緊急市價平倉...")
+            logger.critical(f"🚨 嚴重警告：止損單掛單失敗！正在執行緊急市價平倉...")
             client.order(sym, sl_side, target_qty, reduce_only=True)
             raise HTTPException(status_code=400, detail="止損單設定失敗，已執行緊急平倉保護")
 
