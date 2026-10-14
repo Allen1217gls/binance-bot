@@ -75,7 +75,6 @@ class BinanceClient:
 
     def format_qty(self, sym: str, raw_qty: float) -> float:
         sym = sym.upper()
-        # 如果記憶體中沒有，現場補抓一次防呆
         if sym not in self._precisions:
             try:
                 res = requests.get(f"{FUTURES_URL}/fapi/v1/exchangeInfo").json()
@@ -116,10 +115,17 @@ class BinanceClient:
     def get_pos(self, sym: str) -> float:
         p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
         p["signature"] = self._sign(p)
-        res = requests.get(f"{FUTURES_URL}/fapi/v2/positionRisk", headers=self._headers(), params=p).json()
-        for pos in res:
-            if pos.get("symbol") == sym.upper():
-                return abs(float(pos.get("positionAmt", 0.0)))
+        try:
+            res = requests.get(f"{FUTURES_URL}/fapi/v2/positionRisk", headers=self._headers(), params=p).json()
+            # 🛡️ 加上防呆防崩潰保護：確保回傳的是 list 才跑迴圈
+            if isinstance(res, list):
+                for pos in res:
+                    if pos.get("symbol") == sym.upper():
+                        return abs(float(pos.get("positionAmt", 0.0)))
+            else:
+                logger.warning(f"取得持倉 API 回傳非預期格式: {res}")
+        except Exception as e:
+            logger.error(f"取得持倉發生錯誤: {e}")
         return 0.0
 
 app = FastAPI()
@@ -147,7 +153,7 @@ async def handle_webhook(sig: Signal):
     if sig.leverage:
         client.set_leverage(sym, sig.leverage)
 
-    # 1. TP1 達到 1.5R 盈虧比：平倉 50% ＋ 止損移至進場價保本
+    # 1. TP1 達到盈虧比目標：平倉 50% ＋ 止損移至進場價保本
     if action in ("TP1_LONG", "TP1_SHORT"):
         pos = client.get_pos(sym)
         if pos > 0:
