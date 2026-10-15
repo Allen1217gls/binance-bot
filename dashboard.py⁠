@@ -1,0 +1,71 @@
+import streamlit as st
+import requests
+import pandas as pd
+
+# 頁面配置
+st.set_page_config(
+    page_title="幣安量化交易儀表盤",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.title("🤖 我的 AI 幣安量化交易控制台")
+st.markdown("即時監控合約帳戶本金、保證金與市場行情。")
+st.markdown("---")
+
+# 設定您的 FastAPI 機器人網址 (請填入您在 Zeabur 上的真實公開網址，結尾不要加 /)
+# 例如: "https://my-binance-bot.zeabur.app"
+BOT_API_URL = st.text_input(
+    "🔗 請輸入您的後端機器人網址 (Zeabur/Render)",
+    value="https://binance-bot.zeabur.app"
+)
+
+if st.button("🔄 重新整理數據", type="primary"):
+    st.rerun()
+
+st.markdown("---")
+
+# 呼叫後端 /test-binance 取得實時數據
+if BOT_API_URL:
+    try:
+        with st.spinner("正在向幣安與機器人同步數據..."):
+            res = requests.get(f"{BOT_API_URL}/test-binance", timeout=8).json()
+            
+        if res.get("status") == "success":
+            total_eq = res.get("total_equity_usdt", 0.0)
+            avail = res.get("available_balance_usdt", 0.0)
+            eth_price = res.get("eth_price", 0.0)
+            api_check = res.get("api_key_check", "未明")
+            
+            # 顯示三大核心數據看板
+            col1, col2, col3 = st.columns(3)
+            col1.metric("💰 帳戶總權益 (USDT)", f"${total_eq:,.2f}")
+            col2.metric("💵 可用保證金 (USDT)", f"${avail:,.2f}")
+            col3.metric("📈 ETH 即時現價", f"${eth_price:,.2f}")
+            
+            st.markdown("---")
+            
+            # 系統狀態與詳細資訊
+            st.subheader("🛠️ 系統運行狀態")
+            st.success("🟢 機器人與幣安 API 連線完全正常！")
+            st.info(f"🔑 當前使用的 API Key 識別碼: `{api_check}`")
+            
+            # 原始資產明細展開
+            with st.expander("📊 點擊查看幣安原始資產明細 (Raw Data)"):
+                raw_data = res.get("binance_raw_response", {})
+                st.json(raw_data)
+                
+        else:
+            st.error(f"後端連線成功，但幣安回傳異常: {res}")
+            
+    except Exception as e:
+        st.error(f"無法連線到機器人後端，請確認網址是否正確或機器人是否在線: {e}")
+
+st.markdown("---")
+st.markdown("### 💡 桌面捷徑小撇步：")
+st.markdown("""
+- **電腦端**：在瀏覽器選單點選「將網頁安裝為應用程式」或「建立捷徑」。
+- **手機端**：點擊瀏覽器的分享按鈕，選擇「加入主畫面螢幕」。
+- 這樣點開就能像 App 一樣**一目了然**隨時看盤！
+""")
