@@ -5,6 +5,8 @@ import hmac
 import hashlib
 import logging
 import secrets
+import threading
+from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlencode
 
@@ -99,14 +101,10 @@ class BinanceClient:
         return None
 
     def get_equity(self) -> Tuple[float, float, Any]:
-        """
-        🚀 查詢合約錢包 USDT 本金與可用餘額 (增加 60000ms recvWindow 防止超時)
-        """
         self._sync()
         p = {"timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p["signature"] = self._sign(p)
 
-        # 方式 1: /fapi/v2/balance
         res = self._safe_request("GET", "/fapi/v2/balance", params=p)
         if isinstance(res, list):
             for b in res:
@@ -116,7 +114,6 @@ class BinanceClient:
                     total_eq = max(eq, avail)
                     return (total_eq, avail, res)
 
-        # 方式 2: /fapi/v2/account
         r2 = self._safe_request("GET", "/fapi/v2/account", params=p)
         if isinstance(r2, dict) and "code" not in r2:
             eq = float(r2.get("totalMarginBalance", r2.get("totalWalletBalance", 0.0)))
@@ -225,6 +222,44 @@ class BinanceClient:
 
 app = FastAPI()
 client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
+trade_memory: Dict[str, Dict[str, Any]] = {}
+
+# 📊 每日 08:00 資產回報背景執行緒
+yesterday_balance = 0.0
+last_report_date = None
+
+def daily_balance_reporter():
+    global yesterday_balance, last_report_date
+    while True:
+        try:
+            now = datetime.now() # 伺服器本地時間 (通常雲端主機是 UTC，可依需求調整)
+            # 檢查是否為早上 8 點 0 分
+            if now.hour == 8 and now.minute == 0:
+                today_date = now.date()
+                if last_report_date != today_date:
+                    total_eq, avail, _ = client.get_equity()
+                    if yesterday_balance > 0:
+                        diff = total_eq - yesterday_balance
+                        pct = (diff / yesterday_balance) * 100 if yesterday_balance > 0 else 0
+                        trend = "📈 增加" if diff >= 0 else "📉 減少"
+                        logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT | 相比昨天: {trend} {abs(diff):.2f} USDT ({pct:+.2f}%)")
+                    else:
+                        logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT (初始化基準已建立)")
+                    
+                    yesterday_balance = total_eq
+                    last_report_date = today_date
+            
+            # 每 45 秒檢查一次，避免錯過整點
+            time.sleep(45)
+        except Exception as e:
+            logger.error(f"每日資產報告背景任務異常: {e}")
+            time.sleep(60)
+
+@app.on_event("startup")
+def startup_event():
+    # 啟動背景執行緒
+    threading.Thread(target=daily_balance_reporter, daemon=True).start()
+    logger.info("已成功啟動每日 08:00 資產報表背景監控服務。")
 
 class Signal(BaseModel):
     passphrase: str
@@ -236,7 +271,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Zeabur Tokyo Ultra-Precision Bot"}
+    return {"status": "online", "feature": "Zeabur Tokyo Ultra-Precision Bot + Daily Report"}
 
 @app.get("/test-binance")
 def test_binance():
@@ -270,7 +305,6 @@ async def handle_webhook(request: Request):
     sym, action = sig.symbol.upper(), sig.action.upper()
     logger.info(f"收到指令: {action} {sym}")
 
-    # 1. TP1 達到 1.5R 盈虧比：平倉 50% ＋ 止損移至進場成本價
     if action in ("TP1_LONG", "TP1_SHORT"):
         pos_amt, entry_price = client.get_position_info(sym)
         if abs(pos_amt) > 0:
@@ -284,7 +318,6 @@ async def handle_webhook(request: Request):
             return {"success": True, "msg": f"TP1已達成：平倉50%並移至成本價保本"}
         return {"success": True, "msg": "目前無持倉，略過TP1"}
 
-    # 2. 趨勢反轉（翻紅或翻綠）：市價全平
     if action in ("CLOSE_LONG", "CLOSE_SHORT"):
         pos_amt, _ = client.get_position_info(sym)
         if abs(pos_amt) > 0:
@@ -296,7 +329,6 @@ async def handle_webhook(request: Request):
             return {"success": True, "msg": f"趨勢反轉：已全平倉 {close_qty} {sym}"}
         return {"success": True, "msg": "目前無持倉，略過平倉"}
 
-    # 3. 進場開倉
     if action in ("LONG", "SHORT"):
         pos_amt, _ = client.get_position_info(sym)
         if abs(pos_amt) > 0:
