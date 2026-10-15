@@ -38,7 +38,10 @@ class BinanceClient:
     def _sync(self):
         try:
             res = requests.get(f"{FUTURES_URL}/fapi/v1/time", timeout=5).json()
-            self.time_offset = res.get("serverTime", int(time.time() * 1000)) - int(time.time() * 1000)
+            server_t = int(res.get("serverTime", time.time() * 1000))
+            local_t = int(time.time() * 1000)
+            self.time_offset = server_t - local_t
+            logger.info(f"伺服器校時完成，偏移量: {self.time_offset}ms")
         except Exception:
             self.time_offset = 0
 
@@ -63,26 +66,30 @@ class BinanceClient:
             logger.error(f"載入 exchangeInfo 失敗: {e}")
 
     def _sign(self, p: Dict[str, Any]) -> str:
-        return hmac.new(self.sec.encode(), urlencode(p).encode(), hashlib.sha256).hexdigest()
+        return hmac.new(self.sec.encode("utf-8"), urlencode(p).encode("utf-8"), hashlib.sha256).hexdigest()
 
     def _headers(self):
-        return {"X-MBX-APIKEY": self.key, "Content-Type": "application/x-www-form-urlencoded"}
+        return {"X-MBX-APIKEY": self.key}
 
     def _safe_request(self, method: str, endpoint: str, params: dict = None, data: dict = None, retries: int = 3) -> Any:
         url = f"{FUTURES_URL}{endpoint}"
         for attempt in range(retries):
             try:
+                headers = self._headers()
                 if method == "GET":
-                    res = requests.get(url, headers=self._headers(), params=params, timeout=10)
+                    res = requests.get(url, headers=headers, params=params, timeout=10)
                 elif method == "DELETE":
-                    res = requests.delete(url, headers=self._headers(), params=params, timeout=10)
+                    res = requests.delete(url, headers=headers, params=params, timeout=10)
                 else:
-                    res = requests.post(url, headers=self._headers(), data=data, timeout=10)
+                    headers["Content-Type"] = "application/x-www-form-urlencoded"
+                    res = requests.post(url, headers=headers, data=data, timeout=10)
                 
                 data_json = res.json()
                 if isinstance(data_json, dict) and data_json.get("code") == -1003:
                     time.sleep(2 * (attempt + 1))
                     continue
+                if isinstance(data_json, dict) and "code" in data_json and data_json.get("code") != 200:
+                    logger.error(f"幣安 API 回傳錯誤 ({endpoint}): {data_json}")
                 return data_json
             except Exception as e:
                 logger.error(f"API 請求異常: {e}")
@@ -91,11 +98,15 @@ class BinanceClient:
                 time.sleep(2)
         return None
 
-    def get_equity(self) -> Tuple[float, float]:
-        p = {"timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 5000}
+    def get_equity(self) -> Tuple[float, float, Any]:
+        """
+        🚀 查詢合約錢包 USDT 本金與可用餘額 (增加 60000ms recvWindow 防止超時)
+        """
+        self._sync()
+        p = {"timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p["signature"] = self._sign(p)
 
-        # 方式 1: /fapi/v2/balance (專門查各幣種合約資產列表)
+        # 方式 1: /fapi/v2/balance
         res = self._safe_request("GET", "/fapi/v2/balance", params=p)
         if isinstance(res, list):
             for b in res:
@@ -103,10 +114,9 @@ class BinanceClient:
                     eq = float(b.get("crossWalletBalance", b.get("balance", 0.0)))
                     avail = float(b.get("availableBalance", 0.0))
                     total_eq = max(eq, avail)
-                    if total_eq > 0:
-                        return (total_eq, avail)
+                    return (total_eq, avail, res)
 
-        # 方式 2: /fapi/v2/account (全面帳戶資訊)
+        # 方式 2: /fapi/v2/account
         r2 = self._safe_request("GET", "/fapi/v2/account", params=p)
         if isinstance(r2, dict) and "code" not in r2:
             eq = float(r2.get("totalMarginBalance", r2.get("totalWalletBalance", 0.0)))
@@ -117,10 +127,9 @@ class BinanceClient:
                         eq = float(a.get("marginBalance", a.get("walletBalance", 0.0)))
                         avail = float(a.get("availableBalance", 0.0))
                         break
-            if max(eq, avail) > 0:
-                return (max(eq, avail), avail)
+            return (max(eq, avail), avail, r2)
 
-        return (0.0, 0.0)
+        return (0.0, 0.0, res if res else r2)
 
     def get_price(self, sym: str) -> float:
         try:
@@ -147,7 +156,7 @@ class BinanceClient:
         sym = sym.upper()
         if self._leverage_cache.get(sym) == lev:
             return
-        p = {"symbol": sym, "leverage": lev, "timestamp": int(time.time() * 1000) + self.time_offset}
+        p = {"symbol": sym, "leverage": lev, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p["signature"] = self._sign(p)
         res = self._safe_request("POST", "/fapi/v1/leverage", data=p)
         if isinstance(res, dict) and res.get("leverage") == lev:
@@ -160,7 +169,8 @@ class BinanceClient:
             "side": side.upper(),
             "type": "MARKET",
             "quantity": formatted_qty,
-            "timestamp": int(time.time() * 1000) + self.time_offset
+            "timestamp": int(time.time() * 1000) + self.time_offset,
+            "recvWindow": 60000
         }
         if reduce_only:
             p["reduceOnly"] = "true"
@@ -179,7 +189,8 @@ class BinanceClient:
             "triggerPrice": formatted_p,
             "closePosition": "true",
             "workingType": "CONTRACT_PRICE",
-            "timestamp": int(time.time() * 1000) + self.time_offset
+            "timestamp": int(time.time() * 1000) + self.time_offset,
+            "recvWindow": 60000
         }
         p["signature"] = self._sign(p)
         res = self._safe_request("POST", "/fapi/v1/algoOrder", data=p)
@@ -191,17 +202,17 @@ class BinanceClient:
 
     def cancel_all(self, sym: str):
         sym = sym.upper()
-        p1 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset}
+        p1 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p1["signature"] = self._sign(p1)
         r1 = self._safe_request("DELETE", "/fapi/v1/allOpenOrders", params=p1, retries=1)
         
-        p2 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset}
+        p2 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p2["signature"] = self._sign(p2)
         r2 = self._safe_request("DELETE", "/fapi/v1/algoOpenOrders", params=p2, retries=1)
         logger.info(f"撤單結果: 一般訂單={r1}, 條件單={r2}")
 
     def get_position_info(self, sym: str) -> Tuple[float, float]:
-        p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
+        p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p["signature"] = self._sign(p)
         res = self._safe_request("GET", "/fapi/v2/positionRisk", params=p)
         if isinstance(res, list):
@@ -229,14 +240,16 @@ def index():
 
 @app.get("/test-binance")
 def test_binance():
-    total_eq, avail = client.get_equity()
+    total_eq, avail, raw_debug = client.get_equity()
     price = client.get_price("ETHUSDT")
     return {
         "status": "success",
-        "msg": "幣安連線完全正常！",
+        "msg": "幣安連線診斷完成",
         "total_equity_usdt": total_eq,
         "available_balance_usdt": avail,
-        "eth_price": price
+        "eth_price": price,
+        "api_key_check": f"{client.key[:6]}...{client.key[-4:]}" if client.key else "未設定API_KEY",
+        "binance_raw_response": raw_debug
     }
 
 @app.post("/webhook")
@@ -295,7 +308,7 @@ async def handle_webhook(request: Request):
         if sig.leverage:
             client.set_leverage(sym, sig.leverage)
 
-        total_eq, avail = client.get_equity()
+        total_eq, avail, _ = client.get_equity()
         curr_p = client.get_price(sym)
         account_base = max(total_eq, avail)
 
