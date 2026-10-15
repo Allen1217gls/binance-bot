@@ -75,13 +75,12 @@ class BinanceClient:
                 if method == "GET":
                     res = requests.get(url, headers=self._headers(), params=params, timeout=10)
                 elif method == "DELETE":
-                    res = requests.delete(url, headers=self._headers(), data=data, timeout=10)
+                    res = requests.delete(url, headers=self._headers(), params=params, timeout=10)
                 else:
                     res = requests.post(url, headers=self._headers(), data=data, timeout=10)
                 
                 data_json = res.json()
                 if isinstance(data_json, dict) and data_json.get("code") == -1003:
-                    logger.warning(f"觸發幣安頻率限制，重試中 ({attempt+1}/{retries})...")
                     time.sleep(2 * (attempt + 1))
                     continue
                 return data_json
@@ -132,11 +131,20 @@ class BinanceClient:
             self._leverage_cache[sym] = lev
 
     def order(self, sym: str, side: str, qty: float, reduce_only: bool = False):
-        p = {"symbol": sym.upper(), "side": side.upper(), "type": "MARKET", "quantity": qty, "timestamp": int(time.time() * 1000) + self.time_offset}
+        formatted_qty = self.format_qty(sym, qty)
+        p = {
+            "symbol": sym.upper(),
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": formatted_qty,
+            "timestamp": int(time.time() * 1000) + self.time_offset
+        }
         if reduce_only:
             p["reduceOnly"] = "true"
         p["signature"] = self._sign(p)
-        return self._safe_request("POST", "/fapi/v1/order", data=p)
+        res = self._safe_request("POST", "/fapi/v1/order", data=p)
+        logger.info(f"市價下單/平倉回應: {res}")
+        return res
 
     def set_sl(self, sym: str, side: str, price: float):
         formatted_p = self.format_price(sym, price)
@@ -162,17 +170,14 @@ class BinanceClient:
         sym = sym.upper()
         p1 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset}
         p1["signature"] = self._sign(p1)
-        self._safe_request("DELETE", "/fapi/v1/allOpenOrders", data=p1, retries=1)
+        r1 = self._safe_request("DELETE", "/fapi/v1/allOpenOrders", params=p1, retries=1)
         
         p2 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset}
         p2["signature"] = self._sign(p2)
-        return self._safe_request("DELETE", "/fapi/v1/algoOpenOrders", data=p2, retries=1)
+        r2 = self._safe_request("DELETE", "/fapi/v1/algoOpenOrders", params=p2, retries=1)
+        logger.info(f"撤單結果: 一般訂單={r1}, 條件單={r2}")
 
     def get_position_info(self, sym: str) -> Tuple[float, float]:
-        """
-        🚀 直接向幣安調取真實持倉顆數與開倉成本均價 (entryPrice)
-        徹底杜絕重啟主機遺失成本價的風險！
-        """
         p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
         p["signature"] = self._sign(p)
         res = self._safe_request("GET", "/fapi/v2/positionRisk", params=p)
@@ -197,7 +202,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Tokyo Zero-Memory-Loss & Double Protection Bot"}
+    return {"status": "online", "feature": "Fixed Auto-Close Precision & Params Bot"}
 
 @app.get("/test-binance")
 def test_binance():
@@ -221,18 +226,20 @@ async def handle_webhook(request: Request):
         raise HTTPException(status_code=401, detail="密碼錯誤")
 
     sym, action = sig.symbol.upper(), sig.action.upper()
+    logger.info(f"收到指令: {action} {sym}")
 
-    # 1. TP1 達到 1.5R：平倉 50% ＋ 直接向幣安抓真實成本價移至保本
+    # 1. TP1 達到 1.5R 盈虧比：平倉 50% ＋ 止損移至進場成本價
     if action in ("TP1_LONG", "TP1_SHORT"):
         pos_amt, entry_price = client.get_position_info(sym)
         if abs(pos_amt) > 0:
             side = "SELL" if "LONG" in action else "BUY"
-            client.order(sym, side, client.format_qty(sym, abs(pos_amt) * 0.5), reduce_only=True)
+            close_qty = client.format_qty(sym, abs(pos_amt) * 0.5)
             client.cancel_all(sym)
+            client.order(sym, side, close_qty, reduce_only=True)
             if entry_price > 0:
                 client.set_sl(sym, side, entry_price)
-                logger.info(f"✅ TP1 減倉 50% 成功，已向幣安調取真實進場價 {entry_price} 掛保本止損！")
-            return {"success": True, "msg": f"TP1已達成：平倉50%並移至真實成本價 {entry_price} 保本"}
+                logger.info(f"✅ TP1 減倉 50% 成功，止損移至成本價 {entry_price}")
+            return {"success": True, "msg": f"TP1已達成：平倉50%並移至成本價保本"}
         return {"success": True, "msg": "目前無持倉，略過TP1"}
 
     # 2. 趨勢反轉（翻紅或翻綠）：市價全平
@@ -241,17 +248,17 @@ async def handle_webhook(request: Request):
         if abs(pos_amt) > 0:
             client.cancel_all(sym)
             side = "SELL" if "LONG" in action else "BUY"
-            client.order(sym, side, abs(pos_amt), reduce_only=True)
-            logger.info(f"✅ 趨勢反轉：已全平倉 {abs(pos_amt)} {sym}")
-            return {"success": True, "msg": "趨勢反轉：全平倉"}
+            close_qty = client.format_qty(sym, abs(pos_amt))
+            res = client.order(sym, side, close_qty, reduce_only=True)
+            logger.info(f"✅ 趨勢反轉全平執行完畢: 方向={side}, 顆數={close_qty}, 回應={res}")
+            return {"success": True, "msg": f"趨勢反轉：已全平倉 {close_qty} {sym}"}
         return {"success": True, "msg": "目前無持倉，略過平倉"}
 
-    # 3. 進場開倉：雙重防呆 ＋ 2% 風險反算 ＋ Algo 掛止損
+    # 3. 進場開倉
     if action in ("LONG", "SHORT"):
-        # 🛡️【第三道防線：防重複開倉金鐘罩】
         pos_amt, _ = client.get_position_info(sym)
         if abs(pos_amt) > 0:
-            logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有 {sym} 持倉 ({pos_amt})，直接略過重複進場訊號。")
+            logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有 {sym} 持倉 ({pos_amt})，略過重複進場。")
             return {"success": True, "msg": f"已有持倉 ({pos_amt})，不重複加倉"}
 
         if not sig.stop_loss:
