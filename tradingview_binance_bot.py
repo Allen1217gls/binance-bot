@@ -91,13 +91,36 @@ class BinanceClient:
                 time.sleep(2)
         return None
 
-    def get_equity(self) -> float:
+    def get_equity(self) -> Tuple[float, float]:
         p = {"timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 5000}
         p["signature"] = self._sign(p)
-        res = self._safe_request("GET", "/fapi/v2/account", params=p)
-        if isinstance(res, dict):
-            return float(res.get("totalMarginBalance", res.get("availableBalance", 0.0)))
-        return 0.0
+
+        # 方式 1: /fapi/v2/balance (專門查各幣種合約資產列表)
+        res = self._safe_request("GET", "/fapi/v2/balance", params=p)
+        if isinstance(res, list):
+            for b in res:
+                if b.get("asset") == "USDT":
+                    eq = float(b.get("crossWalletBalance", b.get("balance", 0.0)))
+                    avail = float(b.get("availableBalance", 0.0))
+                    total_eq = max(eq, avail)
+                    if total_eq > 0:
+                        return (total_eq, avail)
+
+        # 方式 2: /fapi/v2/account (全面帳戶資訊)
+        r2 = self._safe_request("GET", "/fapi/v2/account", params=p)
+        if isinstance(r2, dict) and "code" not in r2:
+            eq = float(r2.get("totalMarginBalance", r2.get("totalWalletBalance", 0.0)))
+            avail = float(r2.get("availableBalance", 0.0))
+            if eq <= 0 and "assets" in r2:
+                for a in r2["assets"]:
+                    if a.get("asset") == "USDT":
+                        eq = float(a.get("marginBalance", a.get("walletBalance", 0.0)))
+                        avail = float(a.get("availableBalance", 0.0))
+                        break
+            if max(eq, avail) > 0:
+                return (max(eq, avail), avail)
+
+        return (0.0, 0.0)
 
     def get_price(self, sym: str) -> float:
         try:
@@ -143,7 +166,7 @@ class BinanceClient:
             p["reduceOnly"] = "true"
         p["signature"] = self._sign(p)
         res = self._safe_request("POST", "/fapi/v1/order", data=p)
-        logger.info(f"市價下單/平倉回應: {res}")
+        logger.info(f"市價單回應: {res}")
         return res
 
     def set_sl(self, sym: str, side: str, price: float):
@@ -202,13 +225,19 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Fixed Auto-Close Precision & Params Bot"}
+    return {"status": "online", "feature": "Zeabur Tokyo Ultra-Precision Bot"}
 
 @app.get("/test-binance")
 def test_binance():
-    equity = client.get_equity()
+    total_eq, avail = client.get_equity()
     price = client.get_price("ETHUSDT")
-    return {"status": "success", "msg": "幣安連線完全正常！", "futures_equity_usdt": equity, "eth_price": price}
+    return {
+        "status": "success",
+        "msg": "幣安連線完全正常！",
+        "total_equity_usdt": total_eq,
+        "available_balance_usdt": avail,
+        "eth_price": price
+    }
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
@@ -266,19 +295,21 @@ async def handle_webhook(request: Request):
         if sig.leverage:
             client.set_leverage(sym, sig.leverage)
 
-        equity = client.get_equity()
+        total_eq, avail = client.get_equity()
         curr_p = client.get_price(sym)
-        if equity <= 0 or curr_p <= 0:
-            raise HTTPException(status_code=400, detail="無法取得帳戶餘額或現價")
+        account_base = max(total_eq, avail)
 
-        risk_usd = equity * ((sig.risk_pct or 2.0) / 100.0)
+        if account_base <= 0 or curr_p <= 0:
+            raise HTTPException(status_code=400, detail="無法取得帳戶保證金餘額或現價")
+
+        risk_usd = account_base * ((sig.risk_pct or 2.0) / 100.0)
         dist = abs(curr_p - sig.stop_loss)
         if dist <= 0:
             raise HTTPException(status_code=400, detail="止損距離為0")
         
         target_qty = client.format_qty(sym, risk_usd / dist)
         if target_qty <= 0:
-            raise HTTPException(status_code=400, detail="計算倉位低於最小下單量")
+            raise HTTPException(status_code=400, detail=f"計算倉位低於最小下單量 (本金={account_base}U, 風險={risk_usd:.2f}U)")
 
         side = "BUY" if action == "LONG" else "SELL"
         sl_side = "SELL" if side == "BUY" else "BUY"
@@ -293,7 +324,7 @@ async def handle_webhook(request: Request):
             client.order(sym, sl_side, target_qty, reduce_only=True)
             raise HTTPException(status_code=400, detail="止損單設定失敗，已執行緊急平倉保護")
 
-        logger.info(f"✅ 開單與強制止損全套成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 顆數={target_qty}{sym}, 止損價={sig.stop_loss}")
+        logger.info(f"✅ 開單與強制止損全套成功: 總本金={account_base}U, 2%風險={risk_usd:.2f}U, 顆數={target_qty}{sym}, 止損價={sig.stop_loss}")
         return {"success": True, "qty": target_qty, "stop_loss": sig.stop_loss}
     
     return {"success": False, "msg": f"未知動作: {action}"}
