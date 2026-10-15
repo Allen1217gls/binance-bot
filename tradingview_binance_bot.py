@@ -17,9 +17,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("ADX_SuperTrend_Bot")
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "Apple")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "Apple").strip()
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() in ("true", "1", "yes")
 FUTURES_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
 
@@ -29,12 +29,11 @@ class BinanceClient:
         self.time_offset = 0
         self._precisions: Dict[str, Tuple[float, int, int]] = {}
         self._leverage_cache: Dict[str, int] = {}
-        
         try:
             self._sync()
             self._load_exchange_info()
         except Exception as e:
-            logger.warning(f"啟動時初始化連線失敗: {e}")
+            logger.warning(f"初始化連線提示: {e}")
 
     def _sync(self):
         try:
@@ -59,7 +58,7 @@ class BinanceClient:
                         if tick < 1:
                             price_prec = max(0, -int(math.log10(tick)))
                 self._precisions[sym] = (step, dec, price_prec)
-            logger.info("已成功預先載入所有交易對的數量與價格精度資訊。")
+            logger.info("已成功載入幣安交易對數量與價格精度資訊。")
         except Exception as e:
             logger.error(f"載入 exchangeInfo 失敗: {e}")
 
@@ -81,14 +80,13 @@ class BinanceClient:
                     res = requests.post(url, headers=self._headers(), data=data, timeout=10)
                 
                 data_json = res.json()
-                
                 if isinstance(data_json, dict) and data_json.get("code") == -1003:
-                    logger.warning(f"觸發幣安頻率限制 (-1003)，正在進行第 {attempt+1} 次重試...")
-                    time.sleep(3 * (attempt + 1))
+                    logger.warning(f"觸發幣安頻率限制，重試中 ({attempt+1}/{retries})...")
+                    time.sleep(2 * (attempt + 1))
                     continue
                 return data_json
             except Exception as e:
-                logger.error(f"API 請求異常 (嘗試 {attempt+1}/{retries}): {e}")
+                logger.error(f"API 請求異常: {e}")
                 if attempt == retries - 1:
                     return None
                 time.sleep(2)
@@ -125,7 +123,6 @@ class BinanceClient:
 
     def set_leverage(self, sym: str, lev: int):
         sym = sym.upper()
-        # 快取槓桿設定，避免每次收訊號都重複打 API 浪費額度
         if self._leverage_cache.get(sym) == lev:
             return
         p = {"symbol": sym, "leverage": lev, "timestamp": int(time.time() * 1000) + self.time_offset}
@@ -142,7 +139,6 @@ class BinanceClient:
         return self._safe_request("POST", "/fapi/v1/order", data=p)
 
     def set_sl(self, sym: str, side: str, price: float):
-        # 🛠️ 完美適配幣安最新 /fapi/v1/algoOrder 規範：必須同時帶入 algoType="CONDITIONAL" 與 type="STOP_MARKET"
         formatted_p = self.format_price(sym, price)
         p = {
             "algoType": "CONDITIONAL",
@@ -156,39 +152,40 @@ class BinanceClient:
         }
         p["signature"] = self._sign(p)
         res = self._safe_request("POST", "/fapi/v1/algoOrder", data=p)
-        
         if isinstance(res, dict) and "algoId" in res:
-            logger.info(f"✅ Algo 強制止損單掛單成功！觸發價: {formatted_p}, 訂單ID: {res.get('algoId')}")
+            logger.info(f"✅ Algo 強制止損單掛單成功！觸發價: {formatted_p}, ID: {res.get('algoId')}")
             return True
-        else:
-            logger.error(f"❌ 幣安拒絕 Algo 止損單！完整回應: {res}")
-            return False
+        logger.error(f"❌ 幣安拒絕 Algo 止損單: {res}")
+        return False
 
     def cancel_all(self, sym: str):
         sym = sym.upper()
-        # 1. 撤銷所有一般掛單
         p1 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset}
         p1["signature"] = self._sign(p1)
         self._safe_request("DELETE", "/fapi/v1/allOpenOrders", data=p1, retries=1)
         
-        # 2. 撤銷所有 Algo 條件止損掛單
         p2 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset}
         p2["signature"] = self._sign(p2)
         return self._safe_request("DELETE", "/fapi/v1/algoOpenOrders", data=p2, retries=1)
 
-    def get_pos(self, sym: str) -> float:
+    def get_position_info(self, sym: str) -> Tuple[float, float]:
+        """
+        🚀 直接向幣安調取真實持倉顆數與開倉成本均價 (entryPrice)
+        徹底杜絕重啟主機遺失成本價的風險！
+        """
         p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset}
         p["signature"] = self._sign(p)
         res = self._safe_request("GET", "/fapi/v2/positionRisk", params=p)
         if isinstance(res, list):
             for pos in res:
                 if pos.get("symbol") == sym.upper():
-                    return abs(float(pos.get("positionAmt", 0.0)))
-        return 0.0
+                    amt = float(pos.get("positionAmt", 0.0))
+                    entry_p = float(pos.get("entryPrice", 0.0))
+                    return (amt, entry_p)
+        return (0.0, 0.0)
 
 app = FastAPI()
 client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
-trade_memory: Dict[str, Dict[str, Any]] = {}
 
 class Signal(BaseModel):
     passphrase: str
@@ -200,20 +197,24 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Tokyo Algo Stop-Loss Protected Bot"}
+    return {"status": "online", "feature": "Tokyo Zero-Memory-Loss & Double Protection Bot"}
+
+@app.get("/test-binance")
+def test_binance():
+    equity = client.get_equity()
+    price = client.get_price("ETHUSDT")
+    return {"status": "success", "msg": "幣安連線完全正常！", "futures_equity_usdt": equity, "eth_price": price}
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     try:
         data = await request.json()
     except Exception as e:
-        logger.error(f"解析 JSON 失敗: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
     try:
         sig = Signal(**data)
     except Exception as e:
-        logger.error(f"Pydantic 模型驗證失敗: {e}")
         raise HTTPException(status_code=400, detail=f"Validation Error: {e}")
 
     if not secrets.compare_digest(sig.passphrase, WEBHOOK_PASSPHRASE):
@@ -221,29 +222,38 @@ async def handle_webhook(request: Request):
 
     sym, action = sig.symbol.upper(), sig.action.upper()
 
+    # 1. TP1 達到 1.5R：平倉 50% ＋ 直接向幣安抓真實成本價移至保本
     if action in ("TP1_LONG", "TP1_SHORT"):
-        pos = client.get_pos(sym)
-        if pos > 0:
+        pos_amt, entry_price = client.get_position_info(sym)
+        if abs(pos_amt) > 0:
             side = "SELL" if "LONG" in action else "BUY"
-            client.order(sym, side, client.format_qty(sym, pos * 0.5), reduce_only=True)
+            client.order(sym, side, client.format_qty(sym, abs(pos_amt) * 0.5), reduce_only=True)
             client.cancel_all(sym)
-            entry_p = trade_memory.get(sym, {}).get("entry_p")
-            if entry_p:
-                client.set_sl(sym, side, entry_p)
-            return {"success": True, "msg": "TP1已達成：平倉50%並移至保本價"}
+            if entry_price > 0:
+                client.set_sl(sym, side, entry_price)
+                logger.info(f"✅ TP1 減倉 50% 成功，已向幣安調取真實進場價 {entry_price} 掛保本止損！")
+            return {"success": True, "msg": f"TP1已達成：平倉50%並移至真實成本價 {entry_price} 保本"}
         return {"success": True, "msg": "目前無持倉，略過TP1"}
 
+    # 2. 趨勢反轉（翻紅或翻綠）：市價全平
     if action in ("CLOSE_LONG", "CLOSE_SHORT"):
-        pos = client.get_pos(sym)
-        if pos > 0:
+        pos_amt, _ = client.get_position_info(sym)
+        if abs(pos_amt) > 0:
             client.cancel_all(sym)
             side = "SELL" if "LONG" in action else "BUY"
-            client.order(sym, side, pos, reduce_only=True)
-            trade_memory.pop(sym, None)
+            client.order(sym, side, abs(pos_amt), reduce_only=True)
+            logger.info(f"✅ 趨勢反轉：已全平倉 {abs(pos_amt)} {sym}")
             return {"success": True, "msg": "趨勢反轉：全平倉"}
         return {"success": True, "msg": "目前無持倉，略過平倉"}
 
+    # 3. 進場開倉：雙重防呆 ＋ 2% 風險反算 ＋ Algo 掛止損
     if action in ("LONG", "SHORT"):
+        # 🛡️【第三道防線：防重複開倉金鐘罩】
+        pos_amt, _ = client.get_position_info(sym)
+        if abs(pos_amt) > 0:
+            logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有 {sym} 持倉 ({pos_amt})，直接略過重複進場訊號。")
+            return {"success": True, "msg": f"已有持倉 ({pos_amt})，不重複加倉"}
+
         if not sig.stop_loss:
             raise HTTPException(status_code=400, detail="必須附帶止損價格")
         if sig.leverage:
@@ -266,36 +276,20 @@ async def handle_webhook(request: Request):
         side = "BUY" if action == "LONG" else "SELL"
         sl_side = "SELL" if side == "BUY" else "BUY"
 
-        # 1. 先清除舊的殘留止損單，再執行市價開單
         client.cancel_all(sym)
         order_res = client.order(sym, side, target_qty)
         if not isinstance(order_res, dict) or "orderId" not in order_res:
-            logger.error(f"❌ 開倉失敗: {order_res}")
             raise HTTPException(status_code=400, detail=f"幣安拒絕開倉: {order_res}")
 
-        # 2. 🛡️ 掛上 Algo 強制止損單
         sl_success = client.set_sl(sym, sl_side, sig.stop_loss)
-        
-        # 3. 如果止損單掛單失敗，立即執行緊急平倉保護
         if not sl_success:
-            logger.critical(f"🚨 嚴重警告：止損單掛單失敗！正在執行緊急市價平倉...")
             client.order(sym, sl_side, target_qty, reduce_only=True)
             raise HTTPException(status_code=400, detail="止損單設定失敗，已執行緊急平倉保護")
 
-        trade_memory[sym] = {"entry_p": curr_p, "qty": target_qty}
         logger.info(f"✅ 開單與強制止損全套成功: 本金={equity}U, 2%風險={risk_usd:.2f}U, 顆數={target_qty}{sym}, 止損價={sig.stop_loss}")
         return {"success": True, "qty": target_qty, "stop_loss": sig.stop_loss}
     
     return {"success": False, "msg": f"未知動作: {action}"}
-
-@app.on_event("startup")
-async def startup_event():
-    try:
-        logger.info("正在測試連接幣安期貨 API...")
-        equity = client.get_equity()
-        logger.info(f"✅ 幣安 API 連線成功！當前帳戶保證金餘額 (Equity): {equity} USDT")
-    except Exception as e:
-        logger.error(f"❌ 幣安 API 連線失敗！錯誤: {e}")
 
 if __name__ == "__main__":
     import uvicorn
