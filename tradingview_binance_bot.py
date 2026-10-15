@@ -232,8 +232,7 @@ def daily_balance_reporter():
     global yesterday_balance, last_report_date
     while True:
         try:
-            now = datetime.now() # 伺服器本地時間 (通常雲端主機是 UTC，可依需求調整)
-            # 檢查是否為早上 8 點 0 分
+            now = datetime.now()
             if now.hour == 8 and now.minute == 0:
                 today_date = now.date()
                 if last_report_date != today_date:
@@ -249,7 +248,6 @@ def daily_balance_reporter():
                     yesterday_balance = total_eq
                     last_report_date = today_date
             
-            # 每 45 秒檢查一次，避免錯過整點
             time.sleep(45)
         except Exception as e:
             logger.error(f"每日資產報告背景任務異常: {e}")
@@ -257,7 +255,6 @@ def daily_balance_reporter():
 
 @app.on_event("startup")
 def startup_event():
-    # 啟動背景執行緒
     threading.Thread(target=daily_balance_reporter, daemon=True).start()
     logger.info("已成功啟動每日 08:00 資產報表背景監控服務。")
 
