@@ -7,6 +7,7 @@ import logging
 import secrets
 import asyncio
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlencode
@@ -209,7 +210,7 @@ class BinanceClient:
             "type": "STOP_MARKET",
             "triggerPrice": formatted_p,
             "closePosition": "true",
-            "workingType": "MARK_PRICE",  # ✅ 修復：改用 MARK_PRICE 標記價格防惡意插針掃損
+            "workingType": "MARK_PRICE",  # ✅ 改用 MARK_PRICE 標記價格防惡意插針掃損
             "timestamp": int(time.time() * 1000) + self.time_offset,
             "recvWindow": 60000
         }
@@ -245,7 +246,6 @@ class BinanceClient:
         return (0.0, 0.0)
 
 
-app = FastAPI()
 client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # 📊 每日台灣時間 08:00 資產回報背景執行緒
@@ -278,10 +278,15 @@ def daily_balance_reporter():
             time.sleep(60)
 
 
-@app.on_event("startup")
-def startup_event():
+# ✅ 採用新版 FastAPI lifespan 生命週期管理器，徹底消除 DeprecationWarning 警告
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     threading.Thread(target=daily_balance_reporter, daemon=True).start()
     logger.info("已成功啟動每日台灣時間 08:00 資產報表背景監控服務。")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class Signal(BaseModel):
@@ -295,7 +300,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2 Pro Fixed)"}
+    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2.1 Lifespan Clean)"}
 
 
 @app.get("/test-binance")
