@@ -6,7 +6,7 @@ import hashlib
 import logging
 import secrets
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlencode
 
@@ -17,13 +17,16 @@ from pydantic import BaseModel
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("ADX_SuperTrend_Bot")
+logger = logging.getLogger("Hull_Turtle_Bot")
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "Apple").strip()
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() in ("true", "1", "yes")
 FUTURES_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
+
+# 台灣時區 (UTC+8)
+TW_TZ = timezone(timedelta(hours=8))
 
 class BinanceClient:
     def __init__(self, key: str, sec: str):
@@ -222,9 +225,8 @@ class BinanceClient:
 
 app = FastAPI()
 client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
-trade_memory: Dict[str, Dict[str, Any]] = {}
 
-# 📊 每日 08:00 資產回報背景執行緒
+# 📊 每日台灣時間 08:00 資產回報背景執行緒
 yesterday_balance = 0.0
 last_report_date = None
 
@@ -232,24 +234,21 @@ def daily_balance_reporter():
     global yesterday_balance, last_report_date
     while True:
         try:
-            now = datetime.now() # 伺服器本地時間 (通常雲端主機是 UTC，可依需求調整)
-            # 檢查是否為早上 8 點 0 分
-            if now.hour == 8 and now.minute == 0:
-                today_date = now.date()
+            now_tw = datetime.now(TW_TZ)
+            if now_tw.hour == 8 and now_tw.minute == 0:
+                today_date = now_tw.date()
                 if last_report_date != today_date:
                     total_eq, avail, _ = client.get_equity()
                     if yesterday_balance > 0:
                         diff = total_eq - yesterday_balance
-                        pct = (diff / yesterday_balance) * 100 if yesterday_balance > 0 else 0
+                        pct = (diff / yesterday_balance) * 100
                         trend = "📈 增加" if diff >= 0 else "📉 減少"
                         logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT | 相比昨天: {trend} {abs(diff):.2f} USDT ({pct:+.2f}%)")
                     else:
-                        logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT (初始化基準已建立)")
+                        logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT (基準已建立)")
                     
                     yesterday_balance = total_eq
                     last_report_date = today_date
-            
-            # 每 45 秒檢查一次，避免錯過整點
             time.sleep(45)
         except Exception as e:
             logger.error(f"每日資產報告背景任務異常: {e}")
@@ -257,9 +256,8 @@ def daily_balance_reporter():
 
 @app.on_event("startup")
 def startup_event():
-    # 啟動背景執行緒
     threading.Thread(target=daily_balance_reporter, daemon=True).start()
-    logger.info("已成功啟動每日 08:00 資產報表背景監控服務。")
+    logger.info("已成功啟動每日台灣時間 08:00 資產報表背景監控服務。")
 
 class Signal(BaseModel):
     passphrase: str
@@ -271,7 +269,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Zeabur Tokyo Ultra-Precision Bot + Daily Report"}
+    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot"}
 
 @app.get("/test-binance")
 def test_binance():
@@ -325,20 +323,31 @@ async def handle_webhook(request: Request):
             side = "SELL" if "LONG" in action else "BUY"
             close_qty = client.format_qty(sym, abs(pos_amt))
             res = client.order(sym, side, close_qty, reduce_only=True)
-            logger.info(f"✅ 趨勢反轉全平執行完畢: 方向={side}, 顆數={close_qty}, 回應={res}")
-            return {"success": True, "msg": f"趨勢反轉：已全平倉 {close_qty} {sym}"}
+            logger.info(f"✅ 止損/反轉全平執行完畢: 方向={side}, 顆數={close_qty}, 回應={res}")
+            return {"success": True, "msg": f"已全平倉 {close_qty} {sym}"}
         return {"success": True, "msg": "目前無持倉，略過平倉"}
 
     if action in ("LONG", "SHORT"):
         pos_amt, _ = client.get_position_info(sym)
-        if abs(pos_amt) > 0:
-            logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有 {sym} 持倉 ({pos_amt})，略過重複進場。")
-            return {"success": True, "msg": f"已有持倉 ({pos_amt})，不重複加倉"}
+        
+        # 1. 同方向持倉：防重複加倉保護
+        if (action == "LONG" and pos_amt > 0) or (action == "SHORT" and pos_amt < 0):
+            logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有同向 {sym} 持倉 ({pos_amt})，略過重複進場。")
+            return {"success": True, "msg": f"已有同向持倉 ({pos_amt})，不重複加倉"}
+
+        # 2. 反向持倉：趨勢反轉時自動先平掉舊反向單，再無縫反手開新單（避免雙 Webhook 撞車）
+        if (action == "LONG" and pos_amt < 0) or (action == "SHORT" and pos_amt > 0):
+            logger.info(f"🔄 偵測到趨勢反手 ({action})：正在自動平倉舊反向持倉 ({pos_amt})...")
+            client.cancel_all(sym)
+            close_side = "BUY" if pos_amt < 0 else "SELL"
+            close_qty = client.format_qty(sym, abs(pos_amt))
+            client.order(sym, close_side, close_qty, reduce_only=True)
+            time.sleep(0.3)
 
         if not sig.stop_loss:
             raise HTTPException(status_code=400, detail="必須附帶止損價格")
-        if sig.leverage:
-            client.set_leverage(sym, sig.leverage)
+        lev = sig.leverage or 10
+        client.set_leverage(sym, lev)
 
         total_eq, avail, _ = client.get_equity()
         curr_p = client.get_price(sym)
@@ -352,7 +361,12 @@ async def handle_webhook(request: Request):
         if dist <= 0:
             raise HTTPException(status_code=400, detail="止損距離為0")
         
-        target_qty = client.format_qty(sym, risk_usd / dist)
+        # 🛡️ 購買力上限保護：避免止損過近時算出超過「可用餘額 × 槓桿」的倉位導致 -2019 報錯
+        raw_risk_qty = risk_usd / dist
+        max_buying_power_qty = ((avail if avail > 0 else account_base) * lev * 0.95) / curr_p
+        safe_raw_qty = min(raw_risk_qty, max_buying_power_qty)
+
+        target_qty = client.format_qty(sym, safe_raw_qty)
         if target_qty <= 0:
             raise HTTPException(status_code=400, detail=f"計算倉位低於最小下單量 (本金={account_base}U, 風險={risk_usd:.2f}U)")
 
