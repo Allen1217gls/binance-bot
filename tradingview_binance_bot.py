@@ -30,7 +30,7 @@ FUTURES_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://f
 # 台灣時區 (UTC+8)
 TW_TZ = timezone(timedelta(hours=8))
 
-# 全域非同步鎖：防止毫秒級連續 Webhook (如 TP1 與 UPDATE_SL) 併發撞車
+# 全域非同步鎖：防止毫秒級連續 Webhook 併發撞車
 webhook_lock = asyncio.Lock()
 
 
@@ -38,7 +38,6 @@ class BinanceClient:
     def __init__(self, key: str, sec: str):
         self.key, self.sec = key, sec
         self.time_offset = 0
-        # 儲存結構: sym -> (step_size, qty_decimals, price_precision, min_notional)
         self._precisions: Dict[str, Tuple[float, int, int, float]] = {}
         self._leverage_cache: Dict[str, int] = {}
         try:
@@ -210,7 +209,7 @@ class BinanceClient:
             "type": "STOP_MARKET",
             "triggerPrice": formatted_p,
             "closePosition": "true",
-            "workingType": "MARK_PRICE",  # ✅ 改用 MARK_PRICE 標記價格防惡意插針掃損
+            "workingType": "MARK_PRICE",
             "timestamp": int(time.time() * 1000) + self.time_offset,
             "recvWindow": 60000
         }
@@ -248,7 +247,6 @@ class BinanceClient:
 
 client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
 
-# 📊 每日台灣時間 08:00 資產回報背景執行緒
 yesterday_balance = 0.0
 last_report_date = None
 
@@ -278,7 +276,6 @@ def daily_balance_reporter():
             time.sleep(60)
 
 
-# ✅ 採用新版 FastAPI lifespan 生命週期管理器，徹底消除 DeprecationWarning 警告
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     threading.Thread(target=daily_balance_reporter, daemon=True).start()
@@ -300,7 +297,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2.1 Lifespan Clean)"}
+    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2.3 Dust Clean Enhanced)"}
 
 
 @app.get("/test-binance")
@@ -338,7 +335,7 @@ async def handle_webhook(request: Request):
 
     async with webhook_lock:
         # ==========================================
-        # A. TP1 保本與 50% 減倉處理 (含防裸奔與小資金保護)
+        # A. TP1 保本與 50% 減倉處理
         # ==========================================
         if action in ("TP1_LONG", "TP1_SHORT"):
             pos_amt, entry_price = client.get_position_info(sym)
@@ -351,14 +348,12 @@ async def handle_webhook(request: Request):
             side = "SELL" if "LONG" in action else "BUY"
             close_qty = client.format_qty(sym, abs(pos_amt) * 0.5)
 
-            # 1. 先執行 50% 減倉（此時舊止損單仍在場上保護）
             if 0 < close_qty < abs(pos_amt):
                 client.order(sym, side, close_qty, reduce_only=True)
                 logger.info(f"✅ TP1 減倉 50% ({close_qty} {sym}) 執行成功")
             else:
                 logger.info(f"ℹ️ 持倉顆數 ({abs(pos_amt)}) 過小無法對半拆分，直接將全倉移至保本止損")
 
-            # 2. 撤除舊止損並掛入成本價保本止損（若失敗則緊急全平防裸奔）
             if entry_price > 0:
                 client.cancel_all(sym)
                 sl_ok = client.set_sl(sym, side, entry_price)
@@ -395,20 +390,20 @@ async def handle_webhook(request: Request):
             return {"success": True, "msg": f"移動止損已更新至 {sig.stop_loss}"}
 
         # ==========================================
-        # C. 止損或盤整反轉平倉 (CLOSE_LONG / CLOSE_SHORT)
+        # C. 止損或盤整反轉平倉 (CLOSE_LONG / CLOSE_SHORT) - 🛡️ 強制徹底清空灰塵單
         # ==========================================
         if action in ("CLOSE_LONG", "CLOSE_SHORT"):
             pos_amt, _ = client.get_position_info(sym)
             if abs(pos_amt) > 0:
-                if ("LONG" in action and pos_amt < 0) or ("SHORT" in action and pos_amt > 0):
-                    return {"success": True, "msg": "持倉方向已改變，略過舊平倉指令"}
                 client.cancel_all(sym)
                 side = "SELL" if pos_amt > 0 else "BUY"
-                close_qty = client.format_qty(sym, abs(pos_amt))
-                res = client.order(sym, side, close_qty, reduce_only=True)
-                logger.info(f"✅ 平倉執行完畢: 方向={side}, 顆數={close_qty}, 回應={res}")
-                return {"success": True, "msg": f"已全平倉 {close_qty} {sym}"}
-            return {"success": True, "msg": "目前無持倉，略過平倉"}
+                raw_close_qty = abs(pos_amt)
+                res = client.order(sym, side, raw_close_qty, reduce_only=True)
+                logger.info(f"✅ 強制全平倉執行完畢: 方向={side}, 顆數={raw_close_qty}, 回應={res}")
+                return {"success": True, "msg": f"已強制清空所有剩餘部位 {raw_close_qty} {sym}"}
+            
+            client.cancel_all(sym)
+            return {"success": True, "msg": "目前無持倉，已清理殘留掛單"}
 
         # ==========================================
         # D. 進場與趨勢反手開倉 (LONG / SHORT)
@@ -421,14 +416,13 @@ async def handle_webhook(request: Request):
                 logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有同向 {sym} 持倉 ({pos_amt})，略過重複進場。")
                 return {"success": True, "msg": f"已有同向持倉 ({pos_amt})，不重複加倉"}
 
-            # 2. 反向持倉：趨勢反轉時自動先平掉舊反向單，再無縫反手開新單
-            if (action == "LONG" and pos_amt < 0) or (action == "SHORT" and pos_amt > 0):
-                logger.info(f"🔄 偵測到趨勢反手 ({action})：正在自動平倉舊反向持倉 ({pos_amt})...")
+            # 2. 🛡️ 關鍵升級：開新單前自動強力清空任何殘餘的灰塵單或反向部位
+            if abs(pos_amt) > 0:
+                logger.info(f"🔄 偵測到殘留部位/反向持倉 ({pos_amt})：正在徹底強力清空以準備新開倉...")
                 client.cancel_all(sym)
                 close_side = "BUY" if pos_amt < 0 else "SELL"
-                close_qty = client.format_qty(sym, abs(pos_amt))
-                client.order(sym, close_side, close_qty, reduce_only=True)
-                time.sleep(0.3)
+                client.order(sym, close_side, abs(pos_amt), reduce_only=True)
+                time.sleep(0.4)
 
             if not sig.stop_loss:
                 raise HTTPException(status_code=400, detail="必須附帶止損價格")
@@ -447,17 +441,14 @@ async def handle_webhook(request: Request):
             if dist <= 0:
                 raise HTTPException(status_code=400, detail="止損距離為0")
 
-            # 🛡️ 計算風險顆數與 93U 小資金最小下單名義價值 (MIN_NOTIONAL) 自動保護
             raw_risk_qty = risk_usd / dist
             min_notional = client.get_min_notional(sym)
             min_notional_qty = client.format_qty(sym, (min_notional * 1.05) / curr_p, round_up=True)
 
-            # 若風險算出的倉位略低於幣安最小下單金額 (例如 5U)，自動補足至最小可開倉顆數
             if raw_risk_qty * curr_p < min_notional:
-                logger.info(f"ℹ️ 風險計算倉位價值 ({raw_risk_qty * curr_p:.2f}U) 低於幣安最小門檻 ({min_notional}U)，自動微調補足至最小可下單顆數 {min_notional_qty}")
+                logger.info(f"ℹ️ 風險計算倉位價值低於幣安最小門檻，自動微調至最小可下單顆數 {min_notional_qty}")
                 raw_risk_qty = min_notional_qty
 
-            # 🛡️ 購買力上限保護：避免超過「可用餘額 × 槓桿」導致 -2019 報錯
             max_buying_power_qty = ((avail if avail > 0 else account_base) * lev * 0.95) / curr_p
             safe_raw_qty = min(raw_risk_qty, max_buying_power_qty)
 
@@ -465,7 +456,7 @@ async def handle_webhook(request: Request):
             if target_qty <= 0 or (target_qty * curr_p) < min_notional:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"計算倉位 ({target_qty} {sym} ≈ {target_qty * curr_p:.2f}U) 低於幣安最小下單要求 ({min_notional}U)"
+                    detail=f"計算倉位 ({target_qty} {sym}) 低於幣安最小下單要求 ({min_notional}U)"
                 )
 
             side = "BUY" if action == "LONG" else "SELL"
