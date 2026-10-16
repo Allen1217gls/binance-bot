@@ -159,9 +159,11 @@ class BinanceClient:
         if sym not in self._precisions:
             self._load_exchange_info()
         step, dec, _, _ = self._precisions.get(sym, (0.001, 3, 2, 5.0))
+        # ✅ 關鍵修復：先 round(..., 8) 消除 Python 二進位浮點數誤差 (例如防止 9.1 / 0.1 變成 90.99999999999999 被砍成 9.0)
+        steps_count = round(raw_qty / step, 8)
         if round_up:
-            return round(math.ceil(raw_qty / step) * step, dec)
-        return round(math.floor(raw_qty / step) * step, dec)
+            return round(math.ceil(steps_count) * step, dec)
+        return round(math.floor(steps_count) * step, dec)
 
     def format_price(self, sym: str, raw_price: float) -> float:
         sym = sym.upper()
@@ -297,7 +299,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2.3 Dust Clean Enhanced)"}
+    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2.4 Precision & Dust Fixed)"}
 
 
 @app.get("/test-binance")
@@ -346,13 +348,17 @@ async def handle_webhook(request: Request):
                 return {"success": True, "msg": "持倉方向與TP1不符，略過"}
 
             side = "SELL" if "LONG" in action else "BUY"
+            curr_p = client.get_price(sym)
+            min_notional = client.get_min_notional(sym)
             close_qty = client.format_qty(sym, abs(pos_amt) * 0.5)
+            rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
 
-            if 0 < close_qty < abs(pos_amt):
+            # 確保減倉後剩餘的尾倉價值仍大於最小名義價值 (如 5U)，避免尾倉變成灰塵單
+            if 0 < close_qty < abs(pos_amt) and (rem_qty * curr_p >= min_notional):
                 client.order(sym, side, close_qty, reduce_only=True)
-                logger.info(f"✅ TP1 減倉 50% ({close_qty} {sym}) 執行成功")
+                logger.info(f"✅ TP1 減倉 50% ({close_qty} {sym}) 執行成功，尾倉保留 {rem_qty} {sym}")
             else:
-                logger.info(f"ℹ️ 持倉顆數 ({abs(pos_amt)}) 過小無法對半拆分，直接將全倉移至保本止損")
+                logger.info(f"ℹ️ 持倉拆分後尾倉將低於 {min_notional}U，為防產生灰塵單，直接將 100% 倉位止損移至保本價")
 
             if entry_price > 0:
                 client.cancel_all(sym)
@@ -390,18 +396,20 @@ async def handle_webhook(request: Request):
             return {"success": True, "msg": f"移動止損已更新至 {sig.stop_loss}"}
 
         # ==========================================
-        # C. 止損或盤整反轉平倉 (CLOSE_LONG / CLOSE_SHORT) - 🛡️ 強制徹底清空灰塵單
+        # C. 止損或盤整反轉平倉 (CLOSE_LONG / CLOSE_SHORT)
         # ==========================================
         if action in ("CLOSE_LONG", "CLOSE_SHORT"):
             pos_amt, _ = client.get_position_info(sym)
             if abs(pos_amt) > 0:
+                if ("LONG" in action and pos_amt < 0) or ("SHORT" in action and pos_amt > 0):
+                    return {"success": True, "msg": "持倉方向已改變，略過舊平倉指令"}
                 client.cancel_all(sym)
                 side = "SELL" if pos_amt > 0 else "BUY"
                 raw_close_qty = abs(pos_amt)
                 res = client.order(sym, side, raw_close_qty, reduce_only=True)
                 logger.info(f"✅ 強制全平倉執行完畢: 方向={side}, 顆數={raw_close_qty}, 回應={res}")
                 return {"success": True, "msg": f"已強制清空所有剩餘部位 {raw_close_qty} {sym}"}
-            
+
             client.cancel_all(sym)
             return {"success": True, "msg": "目前無持倉，已清理殘留掛單"}
 
@@ -410,15 +418,18 @@ async def handle_webhook(request: Request):
         # ==========================================
         if action in ("LONG", "SHORT"):
             pos_amt, _ = client.get_position_info(sym)
+            curr_p = client.get_price(sym)
+            min_notional = client.get_min_notional(sym)
+            pos_notional = abs(pos_amt) * curr_p
 
-            # 1. 同方向持倉：防重複加倉保護
-            if (action == "LONG" and pos_amt > 0) or (action == "SHORT" and pos_amt < 0):
-                logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有同向 {sym} 持倉 ({pos_amt})，略過重複進場。")
+            # 1. 同方向持倉：唯有當持倉價值 >= 最小名義價值 (非灰塵單) 時，才啟動防重複加倉保護
+            if ((action == "LONG" and pos_amt > 0) or (action == "SHORT" and pos_amt < 0)) and (pos_notional >= min_notional):
+                logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有正常同向 {sym} 持倉 ({pos_amt} ≈ {pos_notional:.2f}U)，略過重複進場。")
                 return {"success": True, "msg": f"已有同向持倉 ({pos_amt})，不重複加倉"}
 
-            # 2. 🛡️ 關鍵升級：開新單前自動強力清空任何殘餘的灰塵單或反向部位
+            # 2. 自動強力清空任何「反向持倉」或「同向殘留灰塵單 (如 0.93U)」
             if abs(pos_amt) > 0:
-                logger.info(f"🔄 偵測到殘留部位/反向持倉 ({pos_amt})：正在徹底強力清空以準備新開倉...")
+                logger.info(f"🔄 偵測到反向持倉或殘留灰塵單 ({pos_amt} ≈ {pos_notional:.2f}U)：正在徹底清空以準備新開倉...")
                 client.cancel_all(sym)
                 close_side = "BUY" if pos_amt < 0 else "SELL"
                 client.order(sym, close_side, abs(pos_amt), reduce_only=True)
@@ -430,7 +441,8 @@ async def handle_webhook(request: Request):
             client.set_leverage(sym, lev)
 
             total_eq, avail, _ = client.get_equity()
-            curr_p = client.get_price(sym)
+            if curr_p <= 0:
+                curr_p = client.get_price(sym)
             account_base = max(total_eq, avail)
 
             if account_base <= 0 or curr_p <= 0:
@@ -442,7 +454,6 @@ async def handle_webhook(request: Request):
                 raise HTTPException(status_code=400, detail="止損距離為0")
 
             raw_risk_qty = risk_usd / dist
-            min_notional = client.get_min_notional(sym)
             min_notional_qty = client.format_qty(sym, (min_notional * 1.05) / curr_p, round_up=True)
 
             if raw_risk_qty * curr_p < min_notional:
