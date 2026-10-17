@@ -9,7 +9,7 @@ import asyncio
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import urlencode
 
 import requests
@@ -40,6 +40,7 @@ class BinanceClient:
         self.time_offset = 0
         self._precisions: Dict[str, Tuple[float, int, int, float]] = {}
         self._leverage_cache: Dict[str, int] = {}
+        self._tp1_placed: Dict[str, bool] = {}
         try:
             self._sync()
             self._load_exchange_info()
@@ -201,6 +202,42 @@ class BinanceClient:
         logger.info(f"市價單回應: {res}")
         return res
 
+    def set_tp_limit(self, sym: str, side: str, qty: float, price: float) -> bool:
+        """開倉時直接預掛 1.5R 的 50% 限價止盈單 (Maker 0.02% 低手續費 + 零延遲抓插針)"""
+        formatted_qty = self.format_qty(sym, qty)
+        formatted_p = self.format_price(sym, price)
+        if formatted_qty <= 0 or formatted_p <= 0:
+            return False
+        p = {
+            "symbol": sym.upper(),
+            "side": side.upper(),
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": formatted_qty,
+            "price": formatted_p,
+            "reduceOnly": "true",
+            "timestamp": int(time.time() * 1000) + self.time_offset,
+            "recvWindow": 60000
+        }
+        p["signature"] = self._sign(p)
+        res = self._safe_request("POST", "/fapi/v1/order", data=p)
+        if isinstance(res, dict) and "orderId" in res:
+            self._tp1_placed[sym.upper()] = True
+            logger.info(f"✅ 已預掛 1.5R 減半限價止盈單 (Maker): {side} {formatted_qty} {sym} @ {formatted_p}")
+            return True
+        logger.warning(f"⚠️ 預掛 1.5R 限價止盈單未成功 (將由 TP1 訊號市價執行): {res}")
+        self._tp1_placed[sym.upper()] = False
+        return False
+
+    def get_open_tp_orders(self, sym: str) -> List[Dict[str, Any]]:
+        """查詢目前尚未成交的預掛限價止盈單"""
+        p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
+        p["signature"] = self._sign(p)
+        res = self._safe_request("GET", "/fapi/v1/openOrders", params=p)
+        if isinstance(res, list):
+            return [o for o in res if o.get("type") == "LIMIT" and o.get("reduceOnly") is True]
+        return []
+
     def set_sl(self, sym: str, side: str, price: float) -> bool:
         formatted_p = self.format_price(sym, price)
         p = {
@@ -222,7 +259,16 @@ class BinanceClient:
         logger.error(f"❌ 幣安拒絕 Algo 止損單: {res}")
         return False
 
+    def cancel_algo_only(self, sym: str):
+        """僅取消條件止損單 (保留帳上預掛的 50% 限價止盈單不被誤刪)"""
+        sym = sym.upper()
+        p2 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
+        p2["signature"] = self._sign(p2)
+        r2 = self._safe_request("DELETE", "/fapi/v1/algoOpenOrders", params=p2, retries=1)
+        logger.info(f"更新止損撤銷舊條件單結果: {r2}")
+
     def cancel_all(self, sym: str):
+        """取消該交易對所有一般掛單與條件止損單"""
         sym = sym.upper()
         p1 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p1["signature"] = self._sign(p1)
@@ -231,6 +277,7 @@ class BinanceClient:
         p2 = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p2["signature"] = self._sign(p2)
         r2 = self._safe_request("DELETE", "/fapi/v1/algoOpenOrders", params=p2, retries=1)
+        self._tp1_placed[sym] = False
         logger.info(f"撤單結果: 一般訂單={r1}, 條件單={r2}")
 
     def get_position_info(self, sym: str) -> Tuple[float, float]:
@@ -301,11 +348,12 @@ class Signal(BaseModel):
     risk_pct: Optional[float] = 1.5
     stop_loss: Optional[float] = None
     leverage: Optional[int] = 10
+    tp1_rr: Optional[float] = 1.5
 
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2.5 Anti-Slippage & Trail Safe)"}
+    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Bot (v2.6 Pre-Placed 1.5R Limit TP1 + Trail Safe)"}
 
 
 @app.get("/test-binance")
@@ -343,7 +391,7 @@ async def handle_webhook(request: Request):
 
     async with webhook_lock:
         # ==========================================
-        # A. TP1 保本與 50% 減倉處理
+        # A. TP1 保本觸發：確認預掛 50% 止盈單狀態 + 將尾倉止損移至成本價
         # ==========================================
         if action in ("TP1_LONG", "TP1_SHORT"):
             pos_amt, entry_price = client.get_position_info(sym)
@@ -356,14 +404,23 @@ async def handle_webhook(request: Request):
             side = "SELL" if "LONG" in action else "BUY"
             curr_p = client.get_price(sym)
             min_notional = client.get_min_notional(sym)
-            close_qty = client.format_qty(sym, abs(pos_amt) * 0.5)
-            rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
 
-            if 0 < close_qty < abs(pos_amt) and (rem_qty * curr_p >= min_notional):
-                client.order(sym, side, close_qty, reduce_only=True)
-                logger.info(f"✅ TP1 減倉 50% ({close_qty} {sym}) 執行成功，尾倉保留 {rem_qty} {sym}")
+            open_tp_orders = client.get_open_tp_orders(sym)
+            if open_tp_orders:
+                unfilled_qty = sum(max(0.0, float(o.get("origQty", 0.0)) - float(o.get("executedQty", 0.0))) for o in open_tp_orders)
+                client.cancel_all(sym)
+                rem_after = client.format_qty(sym, abs(pos_amt) - unfilled_qty)
+                if 0 < unfilled_qty < abs(pos_amt) and (rem_after * curr_p >= min_notional):
+                    client.order(sym, side, unfilled_qty, reduce_only=True)
+                    logger.info(f"✅ TP1 補平未成交限價單差額 ({unfilled_qty} {sym})，尾倉保留 {rem_after} {sym}")
+            elif not client._tp1_placed.get(sym, False):
+                close_qty = client.format_qty(sym, abs(pos_amt) * 0.5)
+                rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
+                if 0 < close_qty < abs(pos_amt) and (rem_qty * curr_p >= min_notional):
+                    client.order(sym, side, close_qty, reduce_only=True)
+                    logger.info(f"✅ TP1 市價減倉 50% ({close_qty} {sym}) 執行成功，尾倉保留 {rem_qty} {sym}")
             else:
-                logger.info(f"ℹ️ 持倉拆分後尾倉將低於 {min_notional}U，為防產生灰塵單，直接將 100% 倉位止損移至保本價")
+                logger.info(f"🎯 幣安預掛的 1.5R 減半限價止盈單已自動成交！目前剩餘尾倉 {abs(pos_amt)} {sym} 繼續奔跑。")
 
             if entry_price > 0:
                 target_sl = entry_price
@@ -382,7 +439,7 @@ async def handle_webhook(request: Request):
                     logger.warning("🛡️ TP1 時現價已穿過保本止損價導致掛單失敗，已自動市價全平尾倉防止裸奔！")
                     return {"success": True, "msg": "TP1 觸發時價格已回落，已市價全平保護尾倉"}
                 logger.info(f"✅ TP1 保本止損已成功設定至 {target_sl}")
-            return {"success": True, "msg": "TP1已達成：減倉並移至保本止損價"}
+            return {"success": True, "msg": "TP1已達成：50%止盈完成並移至保本止損價"}
 
         # ==========================================
         # B. 海龜移動止損即時同步更新 (UPDATE_SL)
@@ -395,9 +452,10 @@ async def handle_webhook(request: Request):
                 return {"success": True, "msg": "目前無持倉，略過移動止損更新"}
 
             sl_side = "SELL" if pos_amt > 0 else "BUY"
-            client.cancel_all(sym)
+            client.cancel_algo_only(sym)
             sl_ok = client.set_sl(sym, sl_side, sig.stop_loss)
             if not sl_ok:
+                client.cancel_all(sym)
                 rem_amt, _ = client.get_position_info(sym)
                 if abs(rem_amt) > 0:
                     client.order(sym, sl_side, abs(rem_amt), reduce_only=True)
@@ -426,7 +484,7 @@ async def handle_webhook(request: Request):
             return {"success": True, "msg": "目前無持倉，已清理殘留掛單"}
 
         # ==========================================
-        # D. 進場與趨勢反手開倉 (LONG / SHORT)
+        # D. 進場與趨勢反手開倉 (LONG / SHORT) + 同時預掛 1.5R 減半限價止盈單與止損單
         # ==========================================
         if action in ("LONG", "SHORT"):
             pos_amt, _ = client.get_position_info(sym)
@@ -499,8 +557,22 @@ async def handle_webhook(request: Request):
                 client.order(sym, sl_side, target_qty, reduce_only=True)
                 raise HTTPException(status_code=400, detail="止損單設定失敗，已執行緊急平倉保護")
 
-            logger.info(f"✅ 開單與強制標記價止損全套成功: 總本金={account_base:.2f}U, 風險預算={risk_usd:.2f}U, 顆數={target_qty} {sym}, 止損價={sig.stop_loss}")
-            return {"success": True, "qty": target_qty, "stop_loss": sig.stop_loss}
+            _, actual_entry = client.get_position_info(sym)
+            base_entry = actual_entry if actual_entry > 0 else curr_p
+            actual_risk_dist = abs(base_entry - sig.stop_loss)
+            rr_ratio = sig.tp1_rr or 1.5
+            tp1_price = (base_entry + actual_risk_dist * rr_ratio) if action == "LONG" else (base_entry - actual_risk_dist * rr_ratio)
+
+            tp1_qty = client.format_qty(sym, target_qty * 0.5)
+            rem_qty = client.format_qty(sym, target_qty - tp1_qty)
+            if tp1_qty > 0 and (tp1_qty * tp1_price >= min_notional) and (rem_qty * base_entry >= min_notional):
+                client.set_tp_limit(sym, sl_side, tp1_qty, tp1_price)
+            else:
+                client._tp1_placed[sym] = False
+                logger.info(f"ℹ️ 總倉位拆分 50% 後低於 {min_notional}U 門檻，不預掛拆單止盈，待 TP1 時直接將 100% 倉位止損移至保本價。")
+
+            logger.info(f"✅ 開單全套完成: 本金={account_base:.2f}U, 總顆數={target_qty} {sym}, 止損={sig.stop_loss}, 預掛50%止盈價={client.format_price(sym, tp1_price)}")
+            return {"success": True, "qty": target_qty, "stop_loss": sig.stop_loss, "tp1_limit_price": client.format_price(sym, tp1_price)}
 
         return {"success": False, "msg": f"未知動作: {action}"}
 
