@@ -1,7 +1,9 @@
 import os
+import re
 import time
 import math
 import hmac
+import base64
 import hashlib
 import logging
 import secrets
@@ -27,11 +29,75 @@ WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "Apple").strip()
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() in ("true", "1", "yes")
 FUTURES_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
 
+# LINE Messaging API 設定 (於 Zeabur 環境變數設定)
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
+DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "SOLUSDT").strip().upper()
+
 # 台灣時區 (UTC+8)
 TW_TZ = timezone(timedelta(hours=8))
 
 # 全域非同步鎖：防止毫秒級連續 Webhook 併發撞車
 webhook_lock = asyncio.Lock()
+
+# 機器人執行狀態控制 (可由 LINE 指令動態切換)
+bot_state = {
+    "trading_enabled": True,          # 是否允許 TradingView 新開倉訊號
+    "bound_user_id": LINE_USER_ID,    # 自動綁定或環境變數設定的 LINE User ID
+    "last_symbol": DEFAULT_SYMBOL,    # 最近一次操作的交易對
+}
+
+
+# ==========================================
+# LINE 訊息推播與回覆工具函數
+# ==========================================
+def send_line_push(text: str, to_user_id: Optional[str] = None):
+    """主動推播訊息到你的手機 LINE (不阻塞主交易執行緒)"""
+    token = LINE_CHANNEL_ACCESS_TOKEN
+    target_uid = (to_user_id or bot_state.get("bound_user_id") or LINE_USER_ID).strip()
+    if not token or not target_uid:
+        logger.info(f"ℹ️ 尚未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID，略過 LINE 推播:\n{text}")
+        return
+
+    def _push():
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}"
+            }
+            payload = {
+                "to": target_uid,
+                "messages": [{"type": "text", "text": text[:4900]}]
+            }
+            res = requests.post("https://api.line.me/v2/bot/message/push", headers=headers, json=payload, timeout=8)
+            if res.status_code != 200:
+                logger.warning(f"LINE 推播失敗 ({res.status_code}): {res.text}")
+        except Exception as e:
+            logger.error(f"LINE 推播異常: {e}")
+
+    threading.Thread(target=_push, daemon=True).start()
+
+
+def send_line_reply(reply_token: str, text: str):
+    """即時回覆你在 LINE 聊天室發送的指令 (免費額度、不扣推播則數)"""
+    token = LINE_CHANNEL_ACCESS_TOKEN
+    if not token or not reply_token:
+        return
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+        payload = {
+            "replyToken": reply_token,
+            "messages": [{"type": "text", "text": text[:4900]}]
+        }
+        res = requests.post("https://api.line.me/v2/bot/message/reply", headers=headers, json=payload, timeout=8)
+        if res.status_code != 200:
+            logger.warning(f"LINE 回覆失敗 ({res.status_code}): {res.text}")
+    except Exception as e:
+        logger.error(f"LINE 回覆異常: {e}")
 
 
 class BinanceClient:
@@ -41,6 +107,7 @@ class BinanceClient:
         self._precisions: Dict[str, Tuple[float, int, int, float]] = {}
         self._leverage_cache: Dict[str, int] = {}
         self._tp1_placed: Dict[str, bool] = {}
+        self._current_sl: Dict[str, float] = {}
         try:
             self._sync()
             self._load_exchange_info()
@@ -254,6 +321,7 @@ class BinanceClient:
         p["signature"] = self._sign(p)
         res = self._safe_request("POST", "/fapi/v1/algoOrder", data=p)
         if isinstance(res, dict) and "algoId" in res:
+            self._current_sl[sym.upper()] = formatted_p
             logger.info(f"✅ Algo 標記價格止損單掛單成功！觸發價: {formatted_p}, ID: {res.get('algoId')}")
             return True
         logger.error(f"❌ 幣安拒絕 Algo 止損單: {res}")
@@ -278,6 +346,7 @@ class BinanceClient:
         p2["signature"] = self._sign(p2)
         r2 = self._safe_request("DELETE", "/fapi/v1/algoOpenOrders", params=p2, retries=1)
         self._tp1_placed[sym] = False
+        self._current_sl.pop(sym, None)
         logger.info(f"撤單結果: 一般訂單={r1}, 條件單={r2}")
 
     def get_position_info(self, sym: str) -> Tuple[float, float]:
@@ -292,15 +361,82 @@ class BinanceClient:
                     return (amt, entry_p)
         return (0.0, 0.0)
 
+    def get_all_active_positions(self) -> List[Dict[str, Any]]:
+        """取得帳戶內所有非零持倉明細 (包含未實現損益、均價、標記價格)"""
+        p = {"timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
+        p["signature"] = self._sign(p)
+        res = self._safe_request("GET", "/fapi/v2/positionRisk", params=p)
+        active = []
+        if isinstance(res, list):
+            for pos in res:
+                amt = float(pos.get("positionAmt", 0.0))
+                if abs(amt) > 0:
+                    entry_p = float(pos.get("entryPrice", 0.0))
+                    mark_p = float(pos.get("markPrice", 0.0))
+                    upnl = float(pos.get("unRealizedProfit", 0.0))
+                    notional = abs(amt) * (mark_p if mark_p > 0 else entry_p)
+                    if notional >= 1.0:
+                        active.append({
+                            "symbol": pos.get("symbol", ""),
+                            "amt": amt,
+                            "entry_price": entry_p,
+                            "mark_price": mark_p,
+                            "upnl": upnl,
+                            "notional": notional,
+                        })
+        return active
+
 
 client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 yesterday_balance = 0.0
 last_report_date = None
+last_hourly_key = None
 
 
-def daily_balance_reporter():
-    global yesterday_balance, last_report_date
+def build_status_report(title: str = "📊 【帳戶與持倉即時狀態】") -> str:
+    """組裝完整帳戶餘額與持倉報告文字"""
+    now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    total_eq, avail, _ = client.get_equity()
+    positions = client.get_all_active_positions()
+    mode_str = "🟢 正常自動接單中" if bot_state["trading_enabled"] else "⏸️ 已暫停新開倉 (僅保留平倉保護)"
+
+    lines = [
+        f"{title}",
+        f"🕒 時間：{now_str}",
+        f"🤖 狀態：{mode_str}",
+        f"💰 總權益：{total_eq:.2f} USDT",
+        f"💵 可用保證金：{avail:.2f} USDT",
+    ]
+
+    if not positions:
+        sym = bot_state.get("last_symbol", DEFAULT_SYMBOL)
+        curr_p = client.get_price(sym)
+        lines.append(f"📭 目前持倉：空手觀望中 ({sym} 現價 {curr_p})")
+    else:
+        lines.append(f"📈 目前持倉 ({len(positions)} 筆)：")
+        for pos in positions:
+            sym = pos["symbol"]
+            amt = pos["amt"]
+            direction = "🟢 做多 LONG" if amt > 0 else "🔴 做空 SHORT"
+            upnl = pos["upnl"]
+            pnl_icon = "🟢" if upnl >= 0 else "🔴"
+            sl_val = client._current_sl.get(sym, "依幣安條件單")
+            open_tp = client.get_open_tp_orders(sym)
+            tp_str = f"{open_tp[0].get('price')} ({open_tp[0].get('origQty')}顆)" if open_tp else "已成交或未掛載"
+            lines.append(
+                f"・{sym} {direction}\n"
+                f"  顆數：{abs(amt)} | 價值：{pos['notional']:.1f}U\n"
+                f"  成本：{pos['entry_price']} | 現價：{pos['mark_price']}\n"
+                f"  浮動損益：{pnl_icon} {upnl:+.2f} USDT\n"
+                f"  當前止損：{sl_val} | 預掛止盈：{tp_str}"
+            )
+    return "\n".join(lines)
+
+
+def background_scheduler():
+    """背景排程：負責「每日 08:00 資產損益日報」與「每小時整點持倉推播」"""
+    global yesterday_balance, last_report_date, last_hourly_key
     try:
         init_eq, _, _ = client.get_equity()
         if init_eq > 0:
@@ -313,28 +449,55 @@ def daily_balance_reporter():
         try:
             now_tw = datetime.now(TW_TZ)
             today_date = now_tw.date()
+            hour_key = (today_date, now_tw.hour)
+
+            # 1. 每天早上 08:00 每日資產餘額與損益日報
             if now_tw.hour == 8 and now_tw.minute < 5 and last_report_date != today_date:
                 total_eq, avail, _ = client.get_equity()
                 if yesterday_balance > 0:
                     diff = total_eq - yesterday_balance
                     pct = (diff / yesterday_balance) * 100
-                    trend = "📈 增加" if diff >= 0 else "📉 減少"
-                    logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT | 相比昨日基準: {trend} {abs(diff):.2f} USDT ({pct:+.2f}%)")
+                    trend = "📈 獲利增加" if diff >= 0 else "📉 虧損減少"
+                    daily_msg = (
+                        f"🌅 【每日 08:00 帳戶餘額損益日報】\n"
+                        f"🕒 日期：{today_date}\n"
+                        f"💰 今日總權益：{total_eq:.2f} USDT\n"
+                        f"💵 可用保證金：{avail:.2f} USDT\n"
+                        f"📊 昨日基準：{yesterday_balance:.2f} USDT\n"
+                        f"🏆 今日損益：{trend} {abs(diff):.2f} USDT ({pct:+.2f}%)"
+                    )
                 else:
-                    logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT (基準已建立)")
+                    daily_msg = (
+                        f"🌅 【每日 08:00 帳戶餘額損益日報】\n"
+                        f"🕒 日期：{today_date}\n"
+                        f"💰 今日總權益：{total_eq:.2f} USDT (已建立今日基準)"
+                    )
 
+                logger.info(daily_msg.replace("\n", " | "))
+                send_line_push(daily_msg)
                 yesterday_balance = total_eq
                 last_report_date = today_date
-            time.sleep(30)
+                last_hourly_key = hour_key
+
+            # 2. 每隔一小時 (整點 00~04 分) 自動推播帳戶與持倉狀況
+            elif now_tw.minute < 5 and last_hourly_key != hour_key:
+                hourly_msg = build_status_report(title=f"⏰ 【每小時整點巡檢報告 ({now_tw.hour:02d}:00)】")
+                logger.info(f"已執行 {now_tw.hour:02d}:00 每小時整點推播。")
+                send_line_push(hourly_msg)
+                last_hourly_key = hour_key
+
+            time.sleep(25)
         except Exception as e:
-            logger.error(f"每日資產報告背景任務異常: {e}")
+            logger.error(f"背景排程任務異常: {e}")
             time.sleep(60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    threading.Thread(target=daily_balance_reporter, daemon=True).start()
-    logger.info("已成功啟動每日台灣時間 08:00 資產報表背景監控服務。")
+    threading.Thread(target=background_scheduler, daemon=True).start()
+    logger.info("已啟動背景排程服務 (每小時整點持倉推播 + 每日 08:00 損益日報)。")
+    if LINE_CHANNEL_ACCESS_TOKEN and (LINE_USER_ID or bot_state.get("bound_user_id")):
+        send_line_push("🤖 幣安合約機器人 (v3.0 LINE 雙向操控版) 已啟動上線！\n輸入「0」或「說明」可查看所有手機遙控指令。")
     yield
 
 
@@ -353,24 +516,210 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Bot (v2.6 Pre-Placed 1.5R Limit TP1 + Trail Safe)"}
+    return {
+        "status": "online",
+        "feature": "Zeabur Tokyo Hull-Turtle Bot (v3.0 Two-Way LINE Control + Pre-Placed 1.5R TP1)",
+        "trading_enabled": bot_state["trading_enabled"],
+        "line_configured": bool(LINE_CHANNEL_ACCESS_TOKEN),
+        "line_user_bound": bool(bot_state.get("bound_user_id")),
+    }
 
 
 @app.get("/test-binance")
 def test_binance():
     total_eq, avail, raw_debug = client.get_equity()
-    price = client.get_price("SOLUSDT")
+    price = client.get_price(DEFAULT_SYMBOL)
     return {
         "status": "success",
         "msg": "幣安連線診斷完成",
         "total_equity_usdt": total_eq,
         "available_balance_usdt": avail,
-        "sol_price": price,
+        "symbol_price": price,
         "api_key_check": f"{client.key[:6]}...{client.key[-4:]}" if client.key else "未設定API_KEY",
         "binance_raw_response": raw_debug
     }
 
 
+# ==========================================
+# LINE Bot 雙向指令處理中心 (/line-webhook)
+# ==========================================
+def execute_line_command(cmd_text: str, user_id: str) -> str:
+    """解析你在 LINE 輸入的文字指令並執行對應幣安操作"""
+    text = cmd_text.strip()
+    upper_text = text.upper()
+
+    # 若環境變數未綁定 LINE_USER_ID，第一次傳訊息時自動綁定你的帳號
+    if not bot_state.get("bound_user_id") and user_id:
+        bot_state["bound_user_id"] = user_id
+        logger.info(f"✅ 已自動綁定 LINE User ID: {user_id}")
+
+    # 安全白名單檢查：若已在 Zeabur 設定 LINE_USER_ID，則只允許你本人操控
+    if LINE_USER_ID and user_id != LINE_USER_ID:
+        return "⛔ 權限不足：此機器人僅限綁定之本人帳號操控。"
+
+    # 1. 查詢狀態 (輸入 1 / 查詢 / 狀態 / 倉位 / 餘額)
+    if text in ("1", "查詢", "狀態", "倉位", "餘額", "查帳"):
+        return build_status_report(title="📊 【即時帳戶與持倉查詢】")
+
+    # 2. 一鍵全平倉 (輸入 2 / 平倉 / 全平 / 一鍵平倉 或 平倉 SOLUSDT)
+    if text in ("2", "平倉", "全平", "一鍵平倉", "緊急平倉") or upper_text.startswith("平倉 "):
+        parts = upper_text.split()
+        target_sym = parts[1] if len(parts) > 1 else None
+        positions = client.get_all_active_positions()
+
+        if target_sym:
+            positions = [p for p in positions if p["symbol"] == target_sym]
+
+        if not positions:
+            sym_to_clean = target_sym or bot_state.get("last_symbol", DEFAULT_SYMBOL)
+            client.cancel_all(sym_to_clean)
+            return f"📭 目前沒有任何開倉部位（已同步清理 {sym_to_clean} 殘留掛單）。"
+
+        closed_summary = []
+        for pos in positions:
+            sym = pos["symbol"]
+            amt = pos["amt"]
+            side = "SELL" if amt > 0 else "BUY"
+            client.cancel_all(sym)
+            client.order(sym, side, abs(amt), reduce_only=True)
+            closed_summary.append(f"・{sym}：已市價全平 {abs(amt)} 顆 (原浮動損益 {pos['upnl']:+.2f}U)")
+
+        total_eq, _, _ = client.get_equity()
+        return (
+            f"🚨 【LINE 一鍵全平倉執行完畢】\n"
+            + "\n".join(closed_summary)
+            + f"\n💰 平倉後總權益：{total_eq:.2f} USDT"
+        )
+
+    # 3. 手動減倉 50% (輸入 3 / 減半 / 平半)
+    if text in ("3", "減半", "平半", "減倉"):
+        positions = client.get_all_active_positions()
+        if not positions:
+            return "📭 目前沒有任何持倉可供減半。"
+        results = []
+        for pos in positions:
+            sym = pos["symbol"]
+            amt = pos["amt"]
+            side = "SELL" if amt > 0 else "BUY"
+            min_notional = client.get_min_notional(sym)
+            half_qty = client.format_qty(sym, abs(amt) * 0.5)
+            rem_qty = client.format_qty(sym, abs(amt) - half_qty)
+            if half_qty <= 0 or (rem_qty * pos["mark_price"] < min_notional):
+                results.append(f"・{sym}：持倉價值過小無法拆半 (剩餘將低於 {min_notional}U)")
+            else:
+                client.order(sym, side, half_qty, reduce_only=True)
+                results.append(f"・{sym}：已市價減倉 50% ({half_qty} 顆)，剩餘 {rem_qty} 顆繼續持有")
+        return "✂️ 【LINE 手動減倉 50% 結果】\n" + "\n".join(results)
+
+    # 4. 手動一鍵移至成本價保本 (輸入 4 / 保本 / 移保本)
+    if text in ("4", "保本", "移保本"):
+        positions = client.get_all_active_positions()
+        if not positions:
+            return "📭 目前沒有任何持倉可設定保本。"
+        results = []
+        for pos in positions:
+            sym = pos["symbol"]
+            amt = pos["amt"]
+            entry_p = pos["entry_price"]
+            mark_p = pos["mark_price"]
+            sl_side = "SELL" if amt > 0 else "BUY"
+            if (amt > 0 and mark_p <= entry_p) or (amt < 0 and mark_p >= entry_p):
+                results.append(f"・{sym}：目前現價 ({mark_p}) 尚未脫離成本價 ({entry_p})，無法移至保本（若要出場請輸入「2」平倉）")
+            else:
+                client.cancel_algo_only(sym)
+                ok = client.set_sl(sym, sl_side, entry_p)
+                if ok:
+                    results.append(f"・{sym}：✅ 止損已成功移至成本價 {client.format_price(sym, entry_p)} 保本！")
+                else:
+                    results.append(f"・{sym}：❌ 保本止損掛單失敗，請檢查現價是否過近")
+        return "🛡️ 【LINE 手動移保本結果】\n" + "\n".join(results)
+
+    # 5. 手動修改止損價格 (輸入：止損 145.5 或 SL 145.5)
+    m_sl = re.match(r"^(?:5|止損|改止損|SL)\s+([0-9.]+)$", upper_text)
+    if m_sl:
+        new_sl = float(m_sl.group(1))
+        positions = client.get_all_active_positions()
+        if not positions:
+            return "📭 目前無持倉，無法設定止損。"
+        pos = positions[0]
+        sym = pos["symbol"]
+        amt = pos["amt"]
+        sl_side = "SELL" if amt > 0 else "BUY"
+        client.cancel_algo_only(sym)
+        ok = client.set_sl(sym, sl_side, new_sl)
+        if ok:
+            return f"✅ 已手動將 {sym} 標記價止損單更新為：{client.format_price(sym, new_sl)}"
+        return f"❌ 更新 {sym} 止損至 {new_sl} 失敗（請確認價格方向是否合法）。"
+
+    # 6. 暫停接收新開倉訊號 (輸入 6 / 暫停 / 停止)
+    if text in ("6", "暫停", "停止", "暫停開倉"):
+        bot_state["trading_enabled"] = False
+        return "⏸️ 【已暫停自動開新倉】\n機器人現在會略過 TradingView 的新進場訊號（但帳上既有的止損、TP1 與平倉保護仍照常運作）。\n若要恢復自動接單，請輸入「7」或「恢復」。"
+
+    # 7. 恢復接收新開倉訊號 (輸入 7 / 恢復 / 啟動)
+    if text in ("7", "恢復", "啟動", "開始", "恢復開倉"):
+        bot_state["trading_enabled"] = True
+        return "🟢 【已恢復自動交易】\n機器人已重新開始接收 TradingView 所有進出場訊號！"
+
+    # 8. 查詢我的 LINE User ID (輸入 ID / 綁定)
+    if upper_text in ("ID", "USERID", "綁定"):
+        return f"🔑 你的專屬 LINE_USER_ID 為：\n{user_id}\n\n(機器人已自動暫存綁定；你也可以將此字串貼到 Zeabur 環境變數 LINE_USER_ID 永久鎖定權限)"
+
+    # 0. 顯示完整指令選單 (輸入 0 / 說明 / 指令 / 選單 / ? 或其他文字)
+    return (
+        "🤖 【幣安機器人 LINE 遙控指令選單】\n"
+        "直接輸入數字或中文即可執行：\n\n"
+        "👉 輸入「1」或「查詢」\n"
+        "   查看即時總權益、可用餘額與持倉損益\n\n"
+        "👉 輸入「2」或「平倉」\n"
+        "   🚨 一鍵市價全平所有持倉並撤單\n\n"
+        "👉 輸入「3」或「減半」\n"
+        "   手動將目前持倉市價減倉 50% 落袋\n\n"
+        "👉 輸入「4」或「保本」\n"
+        "   手動將目前持倉止損移至開倉成本價\n\n"
+        "👉 輸入「止損 價格」(如：止損 145.2)\n"
+        "   手動修改當前持倉的止損觸發價\n\n"
+        "👉 輸入「6」或「暫停」\n"
+        "   暫停接收 TradingView 新開倉訊號\n\n"
+        "👉 輸入「7」或「恢復」\n"
+        "   恢復接收 TradingView 自動開倉\n\n"
+        f"🔑 你的 LINE ID：{user_id}"
+    )
+
+
+@app.post("/line-webhook")
+async def line_webhook(request: Request):
+    """接收來自 LINE 官方帳號的訊息 Webhook"""
+    raw_body = await request.body()
+
+    if LINE_CHANNEL_SECRET:
+        signature = request.headers.get("X-Line-Signature", "")
+        hash_bytes = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
+        expected_sig = base64.b64encode(hash_bytes).decode("utf-8")
+        if not secrets.compare_digest(signature, expected_sig):
+            raise HTTPException(status_code=400, detail="Invalid LINE signature")
+
+    try:
+        body_json = await request.json()
+    except Exception:
+        return {"status": "ok"}
+
+    events = body_json.get("events", [])
+    for ev in events:
+        if ev.get("type") == "message" and ev.get("message", {}).get("type") == "text":
+            reply_token = ev.get("replyToken", "")
+            user_text = ev.get("message", {}).get("text", "")
+            user_id = ev.get("source", {}).get("userId", "")
+            async with webhook_lock:
+                reply_msg = execute_line_command(user_text, user_id)
+            send_line_reply(reply_token, reply_msg)
+
+    return {"status": "ok"}
+
+
+# ==========================================
+# TradingView 訊號處理中心 (/webhook)
+# ==========================================
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     try:
@@ -387,6 +736,7 @@ async def handle_webhook(request: Request):
         raise HTTPException(status_code=401, detail="密碼錯誤")
 
     sym, action = sig.symbol.upper(), sig.action.upper()
+    bot_state["last_symbol"] = sym
     logger.info(f"收到指令: {action} {sym} (附帶止損: {sig.stop_loss})")
 
     async with webhook_lock:
@@ -406,24 +756,29 @@ async def handle_webhook(request: Request):
             min_notional = client.get_min_notional(sym)
 
             open_tp_orders = client.get_open_tp_orders(sym)
+            tp_note = ""
             if open_tp_orders:
                 unfilled_qty = sum(max(0.0, float(o.get("origQty", 0.0)) - float(o.get("executedQty", 0.0))) for o in open_tp_orders)
                 client.cancel_all(sym)
                 rem_after = client.format_qty(sym, abs(pos_amt) - unfilled_qty)
                 if 0 < unfilled_qty < abs(pos_amt) and (rem_after * curr_p >= min_notional):
                     client.order(sym, side, unfilled_qty, reduce_only=True)
-                    logger.info(f"✅ TP1 補平未成交限價單差額 ({unfilled_qty} {sym})，尾倉保留 {rem_after} {sym}")
+                    tp_note = f"已補平未成交差額 {unfilled_qty} 顆，尾倉保留 {rem_after} 顆"
+                else:
+                    tp_note = f"尾倉保留 {abs(pos_amt)} 顆"
             elif not client._tp1_placed.get(sym, False):
                 close_qty = client.format_qty(sym, abs(pos_amt) * 0.5)
                 rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
                 if 0 < close_qty < abs(pos_amt) and (rem_qty * curr_p >= min_notional):
                     client.order(sym, side, close_qty, reduce_only=True)
-                    logger.info(f"✅ TP1 市價減倉 50% ({close_qty} {sym}) 執行成功，尾倉保留 {rem_qty} {sym}")
+                    tp_note = f"已市價減倉 50% ({close_qty} 顆)，尾倉保留 {rem_qty} 顆"
+                else:
+                    tp_note = f"倉位較小不拆單，保留 {abs(pos_amt)} 顆直接移保本"
             else:
-                logger.info(f"🎯 幣安預掛的 1.5R 減半限價止盈單已自動成交！目前剩餘尾倉 {abs(pos_amt)} {sym} 繼續奔跑。")
+                tp_note = f"預掛之 1.5R 限價單已自動成交 50%！尾倉保留 {abs(pos_amt)} 顆"
 
+            target_sl = entry_price
             if entry_price > 0:
-                target_sl = entry_price
                 if sig.stop_loss and sig.stop_loss > 0:
                     if "LONG" in action:
                         target_sl = max(entry_price, sig.stop_loss)
@@ -436,9 +791,21 @@ async def handle_webhook(request: Request):
                     rem_amt, _ = client.get_position_info(sym)
                     if abs(rem_amt) > 0:
                         client.order(sym, side, abs(rem_amt), reduce_only=True)
-                    logger.warning("🛡️ TP1 時現價已穿過保本止損價導致掛單失敗，已自動市價全平尾倉防止裸奔！")
+                    send_line_push(
+                        f"🛡️ 【TP1 觸發回落保護全平】\n"
+                        f"幣種：{sym}\n"
+                        f"原因：設定保本止損 ({target_sl}) 時現價已穿過成本價，已自動市價全平尾倉保護利潤！"
+                    )
                     return {"success": True, "msg": "TP1 觸發時價格已回落，已市價全平保護尾倉"}
-                logger.info(f"✅ TP1 保本止損已成功設定至 {target_sl}")
+
+            send_line_push(
+                f"🎯 【1.5R TP1 減半止盈 & 保本成功】\n"
+                f"幣種：{sym}\n"
+                f"執行：{tp_note}\n"
+                f"成本均價：{entry_price}\n"
+                f"新保本止損價：{client.format_price(sym, target_sl)}\n"
+                f"狀態：剩餘 50% 尾倉已零風險跟著海龜線奔跑！"
+            )
             return {"success": True, "msg": "TP1已達成：50%止盈完成並移至保本止損價"}
 
         # ==========================================
@@ -447,7 +814,7 @@ async def handle_webhook(request: Request):
         if action == "UPDATE_SL":
             if not sig.stop_loss:
                 return {"success": False, "msg": "UPDATE_SL 缺少 stop_loss 參數"}
-            pos_amt, _ = client.get_position_info(sym)
+            pos_amt, entry_price = client.get_position_info(sym)
             if abs(pos_amt) <= 0:
                 return {"success": True, "msg": "目前無持倉，略過移動止損更新"}
 
@@ -459,25 +826,43 @@ async def handle_webhook(request: Request):
                 rem_amt, _ = client.get_position_info(sym)
                 if abs(rem_amt) > 0:
                     client.order(sym, sl_side, abs(rem_amt), reduce_only=True)
-                logger.warning(f"🛡️ 海龜移動止損 ({sig.stop_loss}) 掛單失敗（現價已穿過止損線），已立即市價平倉出場！")
+                send_line_push(
+                    f"🛡️ 【海龜移動止損觸發市價出場】\n"
+                    f"幣種：{sym}\n"
+                    f"新止損價：{sig.stop_loss} (現價已穿過止損線，已立即市價平倉出場！)"
+                )
                 return {"success": True, "msg": "現價已穿過新移動止損，已市價出場"}
 
-            logger.info(f"🐢 海龜移動止損已同步更新至幣安: {sig.stop_loss}")
-            return {"success": True, "msg": f"移動止損已更新至 {sig.stop_loss}"}
+            formatted_sl = client.format_price(sym, sig.stop_loss)
+            send_line_push(
+                f"🐢 【海龜移動止損上推更新】\n"
+                f"幣種：{sym} ({'做多' if pos_amt > 0 else '做空'})\n"
+                f"當前持倉：{abs(pos_amt)} 顆 (成本 {entry_price})\n"
+                f"最新止損價：{formatted_sl}"
+            )
+            return {"success": True, "msg": f"移動止損已更新至 {formatted_sl}"}
 
         # ==========================================
         # C. 止損或盤整反轉平倉 (CLOSE_LONG / CLOSE_SHORT)
         # ==========================================
         if action in ("CLOSE_LONG", "CLOSE_SHORT"):
-            pos_amt, _ = client.get_position_info(sym)
+            pos_amt, entry_price = client.get_position_info(sym)
             if abs(pos_amt) > 0:
                 if ("LONG" in action and pos_amt < 0) or ("SHORT" in action and pos_amt > 0):
                     return {"success": True, "msg": "持倉方向已改變，略過舊平倉指令"}
                 client.cancel_all(sym)
                 side = "SELL" if pos_amt > 0 else "BUY"
                 raw_close_qty = abs(pos_amt)
-                res = client.order(sym, side, raw_close_qty, reduce_only=True)
-                logger.info(f"✅ 強制全平倉執行完畢: 方向={side}, 顆數={raw_close_qty}, 回應={res}")
+                curr_p = client.get_price(sym)
+                client.order(sym, side, raw_close_qty, reduce_only=True)
+                total_eq, _, _ = client.get_equity()
+                send_line_push(
+                    f"🏁 【止損 / 趨勢出場平倉完成】\n"
+                    f"幣種：{sym} ({'多單平倉' if pos_amt > 0 else '空單平倉'})\n"
+                    f"平倉顆數：{raw_close_qty} 顆\n"
+                    f"進場成本：{entry_price} | 出場參考價：{curr_p}\n"
+                    f"💰 最新總權益：{total_eq:.2f} USDT"
+                )
                 return {"success": True, "msg": f"已強制清空所有剩餘部位 {raw_close_qty} {sym}"}
 
             client.cancel_all(sym)
@@ -487,7 +872,7 @@ async def handle_webhook(request: Request):
         # D. 進場與趨勢反手開倉 (LONG / SHORT) + 同時預掛 1.5R 減半限價止盈單與止損單
         # ==========================================
         if action in ("LONG", "SHORT"):
-            pos_amt, _ = client.get_position_info(sym)
+            pos_amt, old_entry = client.get_position_info(sym)
             curr_p = client.get_price(sym)
             min_notional = client.get_min_notional(sym)
             pos_notional = abs(pos_amt) * curr_p
@@ -496,12 +881,21 @@ async def handle_webhook(request: Request):
                 logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有正常同向 {sym} 持倉 ({pos_amt} ≈ {pos_notional:.2f}U)，略過重複進場。")
                 return {"success": True, "msg": f"已有同向持倉 ({pos_amt})，不重複加倉"}
 
+            reversed_note = ""
             if abs(pos_amt) > 0:
-                logger.info(f"🔄 偵測到反向持倉或殘留灰塵單 ({pos_amt} ≈ {pos_notional:.2f}U)：正在徹底清空以準備新開倉...")
+                logger.info(f"🔄 偵測到反向持倉或殘留灰塵單 ({pos_amt} ≈ {pos_notional:.2f}U)：正在徹底清空...")
                 client.cancel_all(sym)
                 close_side = "BUY" if pos_amt < 0 else "SELL"
                 client.order(sym, close_side, abs(pos_amt), reduce_only=True)
+                reversed_note = f"🔄 已先平掉原反向部位：{abs(pos_amt)} 顆 (均價 {old_entry})\n"
                 time.sleep(0.4)
+
+            if not bot_state["trading_enabled"]:
+                send_line_push(
+                    f"⏸️ 【收到 {sym} {action} 訊號，但目前已暫停開新倉】\n"
+                    f"{reversed_note}若要恢復自動開倉，請在 LINE 輸入「7」或「恢復」。"
+                )
+                return {"success": True, "msg": "目前處於暫停開新倉模式，已略過新進場"}
 
             if not sig.stop_loss:
                 raise HTTPException(status_code=400, detail="必須附帶止損價格")
@@ -517,10 +911,8 @@ async def handle_webhook(request: Request):
                 raise HTTPException(status_code=400, detail="無法取得帳戶保證金餘額或現價")
 
             if action == "LONG" and curr_p <= sig.stop_loss:
-                logger.warning(f"🛡️ 放棄開多：幣安現價 ({curr_p}) 已低於或等於止損價 ({sig.stop_loss})，避免開倉後立即止損。")
                 return {"success": False, "msg": f"現價 ({curr_p}) 已跌破止損價 ({sig.stop_loss})，放棄進場"}
             if action == "SHORT" and curr_p >= sig.stop_loss:
-                logger.warning(f"🛡️ 放棄開空：幣安現價 ({curr_p}) 已高於或等於止損價 ({sig.stop_loss})，避免開倉後立即止損。")
                 return {"success": False, "msg": f"現價 ({curr_p}) 已突破止損價 ({sig.stop_loss})，放棄進場"}
 
             risk_usd = account_base * ((sig.risk_pct or 1.5) / 100.0)
@@ -531,7 +923,6 @@ async def handle_webhook(request: Request):
             min_notional_qty = client.format_qty(sym, (min_notional * 1.05) / curr_p, round_up=True)
 
             if raw_risk_qty * curr_p < min_notional:
-                logger.info(f"ℹ️ 風險計算倉位價值低於幣安最小門檻，自動微調至最小可下單顆數 {min_notional_qty}")
                 raw_risk_qty = min_notional_qty
 
             max_buying_power_qty = ((avail if avail > 0 else account_base) * lev * 0.95) / curr_p
@@ -550,11 +941,13 @@ async def handle_webhook(request: Request):
             client.cancel_all(sym)
             order_res = client.order(sym, side, target_qty)
             if not isinstance(order_res, dict) or "orderId" not in order_res:
+                send_line_push(f"❌ 【{sym} {action} 開倉失敗】\n幣安回應：{order_res}")
                 raise HTTPException(status_code=400, detail=f"幣安拒絕開倉: {order_res}")
 
             sl_success = client.set_sl(sym, sl_side, sig.stop_loss)
             if not sl_success:
                 client.order(sym, sl_side, target_qty, reduce_only=True)
+                send_line_push(f"⚠️ 【{sym} {action} 止損掛單失敗，已緊急平倉保護】")
                 raise HTTPException(status_code=400, detail="止損單設定失敗，已執行緊急平倉保護")
 
             _, actual_entry = client.get_position_info(sym)
@@ -562,17 +955,28 @@ async def handle_webhook(request: Request):
             actual_risk_dist = abs(base_entry - sig.stop_loss)
             rr_ratio = sig.tp1_rr or 1.5
             tp1_price = (base_entry + actual_risk_dist * rr_ratio) if action == "LONG" else (base_entry - actual_risk_dist * rr_ratio)
+            formatted_tp1 = client.format_price(sym, tp1_price)
+            formatted_sl = client.format_price(sym, sig.stop_loss)
 
             tp1_qty = client.format_qty(sym, target_qty * 0.5)
             rem_qty = client.format_qty(sym, target_qty - tp1_qty)
+            tp_status_str = "倉位較小不拆單 (TP1時100%移保本)"
             if tp1_qty > 0 and (tp1_qty * tp1_price >= min_notional) and (rem_qty * base_entry >= min_notional):
-                client.set_tp_limit(sym, sl_side, tp1_qty, tp1_price)
-            else:
-                client._tp1_placed[sym] = False
-                logger.info(f"ℹ️ 總倉位拆分 50% 後低於 {min_notional}U 門檻，不預掛拆單止盈，待 TP1 時直接將 100% 倉位止損移至保本價。")
+                if client.set_tp_limit(sym, sl_side, tp1_qty, tp1_price):
+                    tp_status_str = f"{formatted_tp1} (已預掛 {tp1_qty} 顆 Maker 限價單)"
 
-            logger.info(f"✅ 開單全套完成: 本金={account_base:.2f}U, 總顆數={target_qty} {sym}, 止損={sig.stop_loss}, 預掛50%止盈價={client.format_price(sym, tp1_price)}")
-            return {"success": True, "qty": target_qty, "stop_loss": sig.stop_loss, "tp1_limit_price": client.format_price(sym, tp1_price)}
+            dir_title = "🟢 【做多 LONG 開倉成功】" if action == "LONG" else "🔴 【做空 SHORT 開倉成功】"
+            send_line_push(
+                f"{dir_title}\n"
+                f"{reversed_note}"
+                f"幣種：{sym} ({lev}x)\n"
+                f"開倉顆數：{target_qty} 顆 (約 {target_qty * base_entry:.1f}U)\n"
+                f"成交均價：{base_entry}\n"
+                f"🛡️ 標記止損：{formatted_sl}\n"
+                f"🎯 1.5R 止盈：{tp_status_str}\n"
+                f"💰 帳戶總權益：{account_base:.2f} USDT"
+            )
+            return {"success": True, "qty": target_qty, "stop_loss": formatted_sl, "tp1_limit_price": formatted_tp1}
 
         return {"success": False, "msg": f"未知動作: {action}"}
 
