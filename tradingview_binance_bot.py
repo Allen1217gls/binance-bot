@@ -159,7 +159,6 @@ class BinanceClient:
         if sym not in self._precisions:
             self._load_exchange_info()
         step, dec, _, _ = self._precisions.get(sym, (0.001, 3, 2, 5.0))
-        # ✅ 關鍵修復：先 round(..., 8) 消除 Python 二進位浮點數誤差 (例如防止 9.1 / 0.1 變成 90.99999999999999 被砍成 9.0)
         steps_count = round(raw_qty / step, 8)
         if round_up:
             return round(math.ceil(steps_count) * step, dec)
@@ -255,24 +254,31 @@ last_report_date = None
 
 def daily_balance_reporter():
     global yesterday_balance, last_report_date
+    try:
+        init_eq, _, _ = client.get_equity()
+        if init_eq > 0:
+            yesterday_balance = init_eq
+            logger.info(f"📊 初始資產基準已建立: {yesterday_balance:.2f} USDT")
+    except Exception:
+        pass
+
     while True:
         try:
             now_tw = datetime.now(TW_TZ)
-            if now_tw.hour == 8 and now_tw.minute == 0:
-                today_date = now_tw.date()
-                if last_report_date != today_date:
-                    total_eq, avail, _ = client.get_equity()
-                    if yesterday_balance > 0:
-                        diff = total_eq - yesterday_balance
-                        pct = (diff / yesterday_balance) * 100
-                        trend = "📈 增加" if diff >= 0 else "📉 減少"
-                        logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT | 相比昨天: {trend} {abs(diff):.2f} USDT ({pct:+.2f}%)")
-                    else:
-                        logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT (基準已建立)")
+            today_date = now_tw.date()
+            if now_tw.hour == 8 and now_tw.minute < 5 and last_report_date != today_date:
+                total_eq, avail, _ = client.get_equity()
+                if yesterday_balance > 0:
+                    diff = total_eq - yesterday_balance
+                    pct = (diff / yesterday_balance) * 100
+                    trend = "📈 增加" if diff >= 0 else "📉 減少"
+                    logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT | 相比昨日基準: {trend} {abs(diff):.2f} USDT ({pct:+.2f}%)")
+                else:
+                    logger.info(f"📊 【每日 08:00 資產報告】當前總權益: {total_eq:.2f} USDT (基準已建立)")
 
-                    yesterday_balance = total_eq
-                    last_report_date = today_date
-            time.sleep(45)
+                yesterday_balance = total_eq
+                last_report_date = today_date
+            time.sleep(30)
         except Exception as e:
             logger.error(f"每日資產報告背景任務異常: {e}")
             time.sleep(60)
@@ -299,7 +305,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2.4 Precision & Dust Fixed)"}
+    return {"status": "online", "feature": "Zeabur Tokyo Hull-Turtle Atomic Reversal Bot (v2.5 Anti-Slippage & Trail Safe)"}
 
 
 @app.get("/test-binance")
@@ -353,7 +359,6 @@ async def handle_webhook(request: Request):
             close_qty = client.format_qty(sym, abs(pos_amt) * 0.5)
             rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
 
-            # 確保減倉後剩餘的尾倉價值仍大於最小名義價值 (如 5U)，避免尾倉變成灰塵單
             if 0 < close_qty < abs(pos_amt) and (rem_qty * curr_p >= min_notional):
                 client.order(sym, side, close_qty, reduce_only=True)
                 logger.info(f"✅ TP1 減倉 50% ({close_qty} {sym}) 執行成功，尾倉保留 {rem_qty} {sym}")
@@ -361,16 +366,23 @@ async def handle_webhook(request: Request):
                 logger.info(f"ℹ️ 持倉拆分後尾倉將低於 {min_notional}U，為防產生灰塵單，直接將 100% 倉位止損移至保本價")
 
             if entry_price > 0:
+                target_sl = entry_price
+                if sig.stop_loss and sig.stop_loss > 0:
+                    if "LONG" in action:
+                        target_sl = max(entry_price, sig.stop_loss)
+                    else:
+                        target_sl = min(entry_price, sig.stop_loss)
+
                 client.cancel_all(sym)
-                sl_ok = client.set_sl(sym, side, entry_price)
+                sl_ok = client.set_sl(sym, side, target_sl)
                 if not sl_ok:
                     rem_amt, _ = client.get_position_info(sym)
                     if abs(rem_amt) > 0:
                         client.order(sym, side, abs(rem_amt), reduce_only=True)
-                    logger.warning("🛡️ TP1 時現價已穿過成本價導致保本損掛單失敗，已自動市價全平尾倉防止裸奔！")
+                    logger.warning("🛡️ TP1 時現價已穿過保本止損價導致掛單失敗，已自動市價全平尾倉防止裸奔！")
                     return {"success": True, "msg": "TP1 觸發時價格已回落，已市價全平保護尾倉"}
-                logger.info(f"✅ TP1 保本止損已成功移至成本價 {entry_price}")
-            return {"success": True, "msg": "TP1已達成：減倉並移至成本價保本"}
+                logger.info(f"✅ TP1 保本止損已成功設定至 {target_sl}")
+            return {"success": True, "msg": "TP1已達成：減倉並移至保本止損價"}
 
         # ==========================================
         # B. 海龜移動止損即時同步更新 (UPDATE_SL)
@@ -422,12 +434,10 @@ async def handle_webhook(request: Request):
             min_notional = client.get_min_notional(sym)
             pos_notional = abs(pos_amt) * curr_p
 
-            # 1. 同方向持倉：唯有當持倉價值 >= 最小名義價值 (非灰塵單) 時，才啟動防重複加倉保護
             if ((action == "LONG" and pos_amt > 0) or (action == "SHORT" and pos_amt < 0)) and (pos_notional >= min_notional):
                 logger.info(f"🛡️ 防重複開倉啟動：幣安帳戶已有正常同向 {sym} 持倉 ({pos_amt} ≈ {pos_notional:.2f}U)，略過重複進場。")
                 return {"success": True, "msg": f"已有同向持倉 ({pos_amt})，不重複加倉"}
 
-            # 2. 自動強力清空任何「反向持倉」或「同向殘留灰塵單 (如 0.93U)」
             if abs(pos_amt) > 0:
                 logger.info(f"🔄 偵測到反向持倉或殘留灰塵單 ({pos_amt} ≈ {pos_notional:.2f}U)：正在徹底清空以準備新開倉...")
                 client.cancel_all(sym)
@@ -448,12 +458,18 @@ async def handle_webhook(request: Request):
             if account_base <= 0 or curr_p <= 0:
                 raise HTTPException(status_code=400, detail="無法取得帳戶保證金餘額或現價")
 
-            risk_usd = account_base * ((sig.risk_pct or 1.5) / 100.0)
-            dist = abs(curr_p - sig.stop_loss)
-            if dist <= 0:
-                raise HTTPException(status_code=400, detail="止損距離為0")
+            if action == "LONG" and curr_p <= sig.stop_loss:
+                logger.warning(f"🛡️ 放棄開多：幣安現價 ({curr_p}) 已低於或等於止損價 ({sig.stop_loss})，避免開倉後立即止損。")
+                return {"success": False, "msg": f"現價 ({curr_p}) 已跌破止損價 ({sig.stop_loss})，放棄進場"}
+            if action == "SHORT" and curr_p >= sig.stop_loss:
+                logger.warning(f"🛡️ 放棄開空：幣安現價 ({curr_p}) 已高於或等於止損價 ({sig.stop_loss})，避免開倉後立即止損。")
+                return {"success": False, "msg": f"現價 ({curr_p}) 已突破止損價 ({sig.stop_loss})，放棄進場"}
 
-            raw_risk_qty = risk_usd / dist
+            risk_usd = account_base * ((sig.risk_pct or 1.5) / 100.0)
+            raw_dist = abs(curr_p - sig.stop_loss)
+            safe_dist = max(raw_dist, curr_p * 0.002)
+
+            raw_risk_qty = risk_usd / safe_dist
             min_notional_qty = client.format_qty(sym, (min_notional * 1.05) / curr_p, round_up=True)
 
             if raw_risk_qty * curr_p < min_notional:
