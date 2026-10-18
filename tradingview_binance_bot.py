@@ -58,6 +58,16 @@ bot_state = {
 recent_signals_cache: Dict[str, float] = {}
 trade_logs_mem: List[Tuple[str, str, str, float]] = []
 
+def _disp_sym(sym: str) -> str:
+    """若幣種名稱過長 (>9字元如 1000PEPEUSDT)，自動簡寫尾綴避免手機換行"""
+    return sym[:-4] if (len(sym) > 9 and sym.endswith("USDT")) else sym
+
+def _fmt_qty(val: float) -> str:
+    """去除整數顆數多餘的 .0 (例如 41.0 -> 41，0.057 -> 0.057)"""
+    if abs(val - round(val)) < 1e-8:
+        return str(int(round(val)))
+    return f"{val:.6f}".rstrip("0").rstrip(".")
+
 def is_duplicate_signal(sym: str, action: str, stop_loss: Optional[float]) -> bool:
     now_t = time.time()
     key = f"{sym.upper()}:{action.upper()}:{f'{stop_loss:.6f}' if stop_loss else 'none'}"
@@ -168,6 +178,7 @@ class BinanceClient:
         self.key, self.sec, self.time_offset, self._last_info_load = key, sec, 0, 0.0
         self._precisions: Dict[str, Tuple[float, int, int, float]] = {}
         self._leverage_cache: Dict[Tuple[str, int], int] = {}
+        self._sym_leverage: Dict[str, int] = {}
         self._current_sl: Dict[str, float] = {}
         try:
             self._sync()
@@ -199,17 +210,47 @@ class BinanceClient:
                 for f in s.get("filters", []):
                     ft = f.get("filterType")
                     if ft == "LOT_SIZE":
+                        step_str = str(f.get("stepSize", "0.001")).rstrip("0")
                         step = float(f.get("stepSize", "0.001"))
-                        dec = max(0, -int(round(math.log10(step)))) if step < 1 else 0
+                        dec = len(step_str.split(".")[1]) if ("." in step_str and len(step_str.split(".")[1]) > 0) else 0
                     elif ft == "PRICE_FILTER":
-                        tick = float(f.get("tickSize", "0.01"))
-                        if tick < 1:
-                            price_prec = max(0, -int(round(math.log10(tick))))
+                        tick_str = str(f.get("tickSize", "0.01")).rstrip("0")
+                        if "." in tick_str and len(tick_str.split(".")[1]) > 0:
+                            price_prec = len(tick_str.split(".")[1])
+                        elif float(f.get("tickSize", "0.01")) >= 1:
+                            price_prec = 0
                     elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
                         min_notional = float(f.get("notional", f.get("minNotional", "5.0")))
                 self._precisions[sym] = (step, dec, price_prec, min_notional)
         except Exception as e:
             logger.error(f"載入 exchangeInfo 失敗: {e}")
+
+    def _get_price_dec(self, sym: str, ref_price: float = 0.0) -> int:
+        sym = sym.upper()
+        if sym not in self._precisions:
+            self._load_exchange_info()
+        if sym in self._precisions:
+            return self._precisions[sym][2]
+        p = abs(ref_price)
+        if p >= 100:
+            return 2
+        if p >= 10:
+            return 3
+        if p >= 1:
+            return 4
+        if p >= 0.001:
+            return 6
+        return 7
+
+    def fmt_p(self, sym: str, raw_price: Optional[float]) -> str:
+        """將價格格式化為與幣安 App 倉位顯示 100% 一致的精度字串，消除浮點數長尾"""
+        if raw_price is None:
+            return "--"
+        val = float(raw_price)
+        if val <= 0:
+            return "--"
+        dec = self._get_price_dec(sym, val)
+        return f"{round(val, dec):.{dec}f}"
 
     def _sign(self, p: Dict[str, Any]) -> str:
         return hmac.new(self.sec.encode("utf-8"), urlencode(p).encode("utf-8"), hashlib.sha256).hexdigest()
@@ -271,7 +312,8 @@ class BinanceClient:
 
     def get_price(self, sym: str) -> float:
         try:
-            return float(requests.get(f"{FUTURES_URL}/fapi/v1/ticker/price", params={"symbol": sym.upper()}, timeout=5).json().get("price", 0.0))
+            raw_p = float(requests.get(f"{FUTURES_URL}/fapi/v1/ticker/price", params={"symbol": sym.upper()}, timeout=5).json().get("price", 0.0))
+            return self.format_price(sym, raw_p) if raw_p > 0 else 0.0
         except Exception:
             return 0.0
 
@@ -288,18 +330,15 @@ class BinanceClient:
         return round((math.ceil(sc) if round_up else math.floor(sc)) * step, dec)
 
     def format_price(self, sym: str, raw_price: float) -> float:
-        sym = sym.upper()
-        if sym not in self._precisions:
-            self._load_exchange_info()
-        if sym in self._precisions:
-            return round(raw_price, self._precisions[sym][2])
-        dec = 6 if raw_price < 0.1 else (4 if raw_price < 10 else (3 if raw_price < 100 else 2))
-        return round(raw_price, dec)
+        dec = self._get_price_dec(sym, raw_price)
+        return round(float(raw_price), dec)
 
     def set_leverage(self, sym: str, lev: int) -> int:
         sym = sym.upper()
         if (sym, lev) in self._leverage_cache:
-            return self._leverage_cache[(sym, lev)]
+            actual = self._leverage_cache[(sym, lev)]
+            self._sym_leverage[sym] = actual
+            return actual
         candidates = [lev] + [x for x in (50, 40, 30, 25, 20, 15, 10) if x < lev]
         for try_lev in candidates:
             p = {"symbol": sym, "leverage": try_lev, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
@@ -307,7 +346,9 @@ class BinanceClient:
             res = self._safe_request("POST", "/fapi/v1/leverage", data=p, retries=1)
             if isinstance(res, dict) and res.get("leverage") == try_lev:
                 self._leverage_cache[(sym, lev)] = try_lev
+                self._sym_leverage[sym] = try_lev
                 return try_lev
+        self._sym_leverage[sym] = lev
         return lev
 
     def order(self, sym: str, side: str, qty: float, reduce_only: bool = False):
@@ -321,14 +362,15 @@ class BinanceClient:
         return self._safe_request("POST", "/fapi/v1/order", data=p, retries=3)
 
     def set_sl(self, sym: str, side: str, price: float) -> bool:
-        fp = self.format_price(sym, price)
+        fp_str = self.fmt_p(sym, price)
+        fp_val = self.format_price(sym, price)
         for attempt in range(3):
-            p = {"algoType": "CONDITIONAL", "symbol": sym.upper(), "side": side.upper(), "type": "STOP_MARKET", "triggerPrice": fp,
+            p = {"algoType": "CONDITIONAL", "symbol": sym.upper(), "side": side.upper(), "type": "STOP_MARKET", "triggerPrice": fp_str,
                  "closePosition": "true", "workingType": "MARK_PRICE", "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
             p["signature"] = self._sign(p)
             res = self._safe_request("POST", "/fapi/v1/algoOrder", data=p, retries=2)
             if isinstance(res, dict) and "algoId" in res:
-                self._current_sl[sym.upper()] = fp
+                self._current_sl[sym.upper()] = fp_val
                 return True
             time.sleep(0.35 * (attempt + 1))
         return False
@@ -343,8 +385,9 @@ class BinanceClient:
             if o.get("symbol") == sym and o.get("orderType", o.get("type", "")) in ("STOP_MARKET", "STOP"):
                 tp = float(o.get("triggerPrice", o.get("stopPrice", 0.0)))
                 if tp > 0:
-                    self._current_sl[sym] = tp
-                    return tp
+                    fp = self.format_price(sym, tp)
+                    self._current_sl[sym] = fp
+                    return fp
         return None
 
     def cancel_all(self, sym: str):
@@ -356,13 +399,18 @@ class BinanceClient:
         self._current_sl.pop(sym, None)
 
     def get_position_info(self, sym: str) -> Tuple[float, float]:
-        p = {"symbol": sym.upper(), "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
+        sym = sym.upper()
+        p = {"symbol": sym, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
         p["signature"] = self._sign(p)
         res = self._safe_request("GET", "/fapi/v2/positionRisk", params=p)
         if isinstance(res, list):
             for pos in res:
-                if pos.get("symbol") == sym.upper():
-                    return (float(pos.get("positionAmt", 0.0)), float(pos.get("entryPrice", 0.0)))
+                if pos.get("symbol") == sym:
+                    amt = float(pos.get("positionAmt", 0.0))
+                    ep = self.format_price(sym, float(pos.get("entryPrice", 0.0)))
+                    lev_val = int(float(pos.get("leverage", self._sym_leverage.get(sym, 40)) or 40))
+                    self._sym_leverage[sym] = lev_val
+                    return (amt, ep)
         return (0.0, 0.0)
 
     def verify_position_opened(self, sym: str, expected_action: str, retries: int = 3) -> Tuple[float, float]:
@@ -382,10 +430,29 @@ class BinanceClient:
             for pos in res:
                 amt = float(pos.get("positionAmt", 0.0))
                 if abs(amt) > 0:
-                    ep, mp, upnl = float(pos.get("entryPrice", 0.0)), float(pos.get("markPrice", 0.0)), float(pos.get("unRealizedProfit", 0.0))
-                    notional = abs(amt) * (mp if mp > 0 else ep)
+                    sym = pos.get("symbol", "").upper()
+                    raw_ep = float(pos.get("entryPrice", 0.0))
+                    raw_mp = float(pos.get("markPrice", 0.0))
+                    ep = self.format_price(sym, raw_ep)
+                    mp = self.format_price(sym, raw_mp)
+                    upnl = float(pos.get("unRealizedProfit", 0.0))
+                    lev = int(float(pos.get("leverage", self._sym_leverage.get(sym, 40)) or 40))
+                    self._sym_leverage[sym] = lev
+                    notional = abs(amt) * (raw_mp if raw_mp > 0 else raw_ep)
+                    margin = notional / max(lev, 1)
+                    roi_pct = (upnl / margin * 100.0) if margin > 0 else 0.0
                     if notional >= 1.0:
-                        active.append({"symbol": pos.get("symbol", ""), "amt": amt, "entry_price": ep, "mark_price": mp, "upnl": upnl, "notional": notional})
+                        active.append({
+                            "symbol": sym,
+                            "amt": amt,
+                            "entry_price": ep,
+                            "mark_price": mp,
+                            "upnl": upnl,
+                            "notional": notional,
+                            "leverage": lev,
+                            "margin": margin,
+                            "roi_pct": roi_pct,
+                        })
         return active
 
 init_db()
@@ -393,10 +460,6 @@ client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
 daily_start_balance = 0.0
 last_report_date = None
 last_hourly_key = None
-
-def _disp_sym(sym: str) -> str:
-    """若幣種名稱過長 (>9字元如 1000PEPEUSDT)，自動簡寫尾綴避免手機換行"""
-    return sym[:-4] if (len(sym) > 9 and sym.endswith("USDT")) else sym
 
 def reconcile_state_with_binance(notify_if_repaired: bool = True) -> str:
     try:
@@ -412,7 +475,7 @@ def reconcile_state_with_binance(notify_if_repaired: bool = True) -> str:
             bot_state["last_symbol"] = sym
             ex_sl = client.get_existing_sl_price(sym)
             if ex_sl and ex_sl > 0:
-                lines.append(f"🛡️ 既有止損：{dsym} ({ex_sl})")
+                lines.append(f"🛡️ 既有止損：{dsym} ({client.fmt_p(sym, ex_sl)})")
             else:
                 sl_side = "SELL" if amt > 0 else "BUY"
                 fb = EMERGENCY_SL_FALLBACK_PCT / 100.0
@@ -421,7 +484,7 @@ def reconcile_state_with_binance(notify_if_repaired: bool = True) -> str:
                 else:
                     safe_sl = ep * (1.0 - BE_BUFFER_PCT / 100.0) if mp <= ep * 0.99 else max(ep, mp) * (1.0 + fb)
                 ok = client.set_sl(sym, sl_side, safe_sl)
-                rep_str = f"🔧 自動補掛：{dsym} ({client.format_price(sym, safe_sl)})" if ok else f"🔧 自動補掛：{dsym} (失敗)"
+                rep_str = f"🔧 自動補掛：{dsym} ({client.fmt_p(sym, safe_sl)})" if ok else f"🔧 自動補掛：{dsym} (失敗)"
                 lines.append(rep_str)
                 repaired_lines.append(rep_str)
         if repaired_lines and notify_if_repaired:
@@ -447,7 +510,7 @@ def check_emergency_hard_brake(current_eq: float) -> bool:
             client.cancel_all(sym)
             client.order(sym, "SELL" if amt > 0 else "BUY", abs(amt), reduce_only=True)
             record_trade_log(sym, "EMERGENCY_BRAKE", amt, abs(amt), pos["entry_price"], pos["mark_price"])
-            closed_lines.append(f"✂️ 強制清倉：{_disp_sym(sym)} ({abs(amt)}顆)")
+            closed_lines.append(f"✂️ 強制清倉：{_disp_sym(sym)} ({_fmt_qty(abs(amt))}顆)")
         closed_block = "\n".join(closed_lines) if closed_lines else "✂️ 強制清倉：目前無持倉"
         send_line_push(
             f"🛑 【總權益極限斷路觸發】\n"
@@ -517,19 +580,28 @@ def build_status_report(title: str = "📊 【即時帳戶與持倉查詢】") -
     if not positions:
         sym = bot_state.get("last_symbol", DEFAULT_SYMBOL)
         lines.append("📭 目前持倉：空手觀望中\n")
-        lines.append(f"🔍 最近幣種：{sym} ({client.get_price(sym)})")
+        lines.append(f"🔍 最近幣種：{sym} ({client.fmt_p(sym, client.get_price(sym))})")
     else:
-        lines.append(f"📦 目前持倉：{len(positions)} 筆 (維持 {margin_ratio:.0f}%)")
+        lines.append(f"📦 目前持倉：{len(positions)} 筆 (維持 {margin_ratio:.1f}%)")
         for pos in positions:
             sym, amt, upnl = pos["symbol"], pos["amt"], pos["upnl"]
-            sl_val = client._current_sl.get(sym) or client.get_existing_sl_price(sym) or "依條件單"
+            lev = pos.get("leverage", client._sym_leverage.get(sym, 40))
+            margin_u = pos.get("margin", pos["notional"] / max(lev, 1))
+            roi_pct = pos.get("roi_pct", (upnl / margin_u * 100.0) if margin_u > 0 else 0.0)
+            roi_str = f"{roi_pct:+.0f}%" if abs(roi_pct) >= 10.0 else f"{roi_pct:+.1f}%"
+            raw_sl = client._current_sl.get(sym) or client.get_existing_sl_price(sym)
+            sl_str = client.fmt_p(sym, raw_sl) if raw_sl else "依條件單"
+            ep_str = client.fmt_p(sym, pos["entry_price"])
+            mp_str = client.fmt_p(sym, pos["mark_price"])
+            qty_str = _fmt_qty(abs(amt))
             lines.append(
-                f"\n🔸 【{sym}】{'🟢 做多' if amt > 0 else '🔴 做空'}\n"
-                f"📦 持倉顆數：{abs(amt)} 顆 ({pos['notional']:.0f}U)\n"
-                f"🏷️ 開倉均價：{pos['entry_price']}\n"
-                f"📍 標記現價：{pos['mark_price']}\n"
-                f"💵 浮動損益：{'🟢' if upnl >= 0 else '🔴'} {upnl:+.2f} USDT\n"
-                f"🛡️ 當前止損：{sl_val}"
+                f"\n🔸 【{sym}】{'🟢 做多' if amt > 0 else '🔴 做空'} {lev}x\n"
+                f"💵 未實損益：{'🟢' if upnl >= 0 else '🔴'} {upnl:+.2f}U ({roi_str})\n"
+                f"📦 持倉數量：{pos['notional']:.2f}U ({qty_str}顆)\n"
+                f"🔒 倉位保證：{margin_u:.2f} USDT\n"
+                f"🏷️ 開倉價格：{ep_str}\n"
+                f"📍 標記價格：{mp_str}\n"
+                f"🛡️ 止損價格：{sl_str}"
             )
     return "\n".join(lines)
 
@@ -686,7 +758,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
                 client.cancel_all(sym)
                 ok = client.set_sl(sym, "SELL" if amt > 0 else "BUY", be_p)
                 if ok:
-                    res.append(f"🛡️ 已移保本：{_disp_sym(sym)} ({client.format_price(sym, be_p)})")
+                    res.append(f"🛡️ 已移保本：{_disp_sym(sym)} ({client.fmt_p(sym, be_p)})")
                 else:
                     res.append(f"❌ 掛單失敗：{_disp_sym(sym)} (請查現價)")
         return "🛡️ 【手動移至保本結果】\n" + "\n".join(res)
@@ -700,7 +772,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
         sym, amt = positions[0]["symbol"], positions[0]["amt"]
         client.cancel_all(sym)
         ok = client.set_sl(sym, "SELL" if amt > 0 else "BUY", new_sl)
-        return f"🛡️ 止損更新：{_disp_sym(sym)} ({client.format_price(sym, new_sl)})" if ok else f"❌ 止損失敗：{_disp_sym(sym)}"
+        return f"🛡️ 止損更新：{_disp_sym(sym)} ({client.fmt_p(sym, new_sl)})" if ok else f"❌ 止損失敗：{_disp_sym(sym)}"
 
     if text in ("6", "暫停", "停止", "暫停開倉"):
         bot_state["trading_enabled"] = False
@@ -819,12 +891,12 @@ async def handle_webhook(request: Request):
                 client.order(sym, side, close_qty, reduce_only=True)
                 net_u = record_trade_log(sym, "TP1", pos_amt, close_qty, entry_price, curr_p)
                 tp_lines = (
-                    f"✂️ 減倉顆數：{close_qty} 顆 ({int(round(pct*100))}%)\n"
-                    f"📦 剩餘尾倉：{rem_qty} 顆\n"
+                    f"✂️ 減倉顆數：{_fmt_qty(close_qty)} 顆 ({int(round(pct*100))}%)\n"
+                    f"📦 剩餘尾倉：{_fmt_qty(rem_qty)} 顆\n"
                     f"💵 落袋損益：🟢 {net_u:+.2f} USDT\n"
                 )
             else:
-                tp_lines = f"📦 保留全倉：{abs(pos_amt)} 顆直接移保本\n"
+                tp_lines = f"📦 保留全倉：{_fmt_qty(abs(pos_amt))} 顆直接移保本\n"
 
             be_buf = entry_price * (1.0 + BE_BUFFER_PCT / 100.0) if "LONG" in action else entry_price * (1.0 - BE_BUFFER_PCT / 100.0)
             target_sl = (max(be_buf, sig.stop_loss) if "LONG" in action else min(be_buf, sig.stop_loss)) if (sig.stop_loss and sig.stop_loss > 0) else be_buf
@@ -840,8 +912,8 @@ async def handle_webhook(request: Request):
                 f"🎯 【1.5R TP1 止盈與保本】\n"
                 f"🪙 交易幣種：{sym}\n"
                 f"{tp_lines}"
-                f"🏷️ 開倉均價：{entry_price}\n"
-                f"🛡️ 保本止損：{client.format_price(sym, target_sl)}"
+                f"🏷️ 開倉價格：{client.fmt_p(sym, entry_price)}\n"
+                f"🛡️ 保本止損：{client.fmt_p(sym, target_sl)}"
             )
             return {"success": True, "msg": "TP1完成"}
 
@@ -861,24 +933,25 @@ async def handle_webhook(request: Request):
                 client.order(sym, side, close_qty, reduce_only=True)
                 net_u = record_trade_log(sym, "TP2", pos_amt, close_qty, entry_price, curr_p)
                 tp2_lines = (
-                    f"✂️ 再減顆數：{close_qty} 顆\n"
-                    f"📦 剩餘尾倉：{rem_qty} 顆\n"
+                    f"✂️ 再減顆數：{_fmt_qty(close_qty)} 顆\n"
+                    f"📦 剩餘尾倉：{_fmt_qty(rem_qty)} 顆\n"
                     f"💵 落袋損益：🟢 {net_u:+.2f} USDT\n"
                 )
             else:
-                tp2_lines = f"📦 保留尾倉：{abs(pos_amt)} 顆衝刺\n"
+                tp2_lines = f"📦 保留尾倉：{_fmt_qty(abs(pos_amt))} 顆衝刺\n"
             if sig.stop_loss and sig.stop_loss > 0:
                 client.cancel_all(sym)
                 if not client.set_sl(sym, side, sig.stop_loss):
                     rem_amt, _ = client.get_position_info(sym)
                     if abs(rem_amt) > 0:
                         client.order(sym, side, abs(rem_amt), reduce_only=True)
+            cur_sl = client._current_sl.get(sym)
             send_line_push(
                 f"🚀 【3.0R TP2 二階止盈】\n"
                 f"🪙 交易幣種：{sym}\n"
                 f"{tp2_lines}"
-                f"🏷️ 開倉均價：{entry_price}\n"
-                f"🛡️ 上推止損：{client._current_sl.get(sym, '保本止損')}"
+                f"🏷️ 開倉價格：{client.fmt_p(sym, entry_price)}\n"
+                f"🛡️ 上推止損：{client.fmt_p(sym, cur_sl) if cur_sl else '保本止損'}"
             )
             return {"success": True, "msg": "TP2完成"}
 
@@ -896,9 +969,9 @@ async def handle_webhook(request: Request):
                 if abs(rem_amt) > 0:
                     client.order(sym, sl_side, abs(rem_amt), reduce_only=True)
                     net_u = record_trade_log(sym, "TRAIL_SL", pos_amt, abs(rem_amt), entry_price, curr_p)
-                send_line_push(f"🛡️ 【移動止損觸發出場】\n🪙 交易幣種：{sym}\n📍 出場價格：{curr_p}\n💵 結算損益：{net_u:+.2f} USDT")
+                send_line_push(f"🛡️ 【移動止損觸發出場】\n🪙 交易幣種：{sym}\n📍 出場價格：{client.fmt_p(sym, curr_p)}\n💵 結算損益：{net_u:+.2f} USDT")
                 return {"success": True, "msg": "已市價出場"}
-            fmt_sl = client.format_price(sym, sig.stop_loss)
+            fmt_sl = client.fmt_p(sym, sig.stop_loss)
             logger.info(f"🐢 {sym} 海龜移動止損已靜默更新至 {fmt_sl}")
             return {"success": True, "msg": f"止損已靜默更新至 {fmt_sl}"}
 
@@ -916,9 +989,9 @@ async def handle_webhook(request: Request):
                 send_line_push(
                     f"🏁 【止損 / 趨勢平倉完成】\n"
                     f"🪙 交易幣種：{sym} ({'多單' if pos_amt > 0 else '空單'})\n"
-                    f"📦 平倉顆數：{abs(pos_amt)} 顆\n"
-                    f"🏷️ 進場均價：{entry_price}\n"
-                    f"📍 出場價格：{curr_p}\n"
+                    f"📦 平倉顆數：{_fmt_qty(abs(pos_amt))} 顆\n"
+                    f"🏷️ 開倉價格：{client.fmt_p(sym, entry_price)}\n"
+                    f"📍 出場價格：{client.fmt_p(sym, curr_p)}\n"
                     f"💵 本筆損益：{'🟢' if net_u >= 0 else '🔴'} {net_u:+.2f} USDT\n"
                     f"💰 帳戶權益：{total_eq:.2f} USDT"
                 )
@@ -936,7 +1009,7 @@ async def handle_webhook(request: Request):
                 client.cancel_all(sym)
                 client.order(sym, "BUY" if pos_amt < 0 else "SELL", abs(pos_amt), reduce_only=True)
                 rev_pnl = record_trade_log(sym, "REVERSE_CLOSE", pos_amt, abs(pos_amt), old_entry, curr_p)
-                reversed_note = f"🔄 反手平倉：{abs(pos_amt)}顆 ({rev_pnl:+.2f}U)\n"
+                reversed_note = f"🔄 反手平倉：{_fmt_qty(abs(pos_amt))}顆 ({rev_pnl:+.2f}U)\n"
                 time.sleep(0.4)
 
             total_eq, avail, _ = client.get_equity()
@@ -959,8 +1032,8 @@ async def handle_webhook(request: Request):
                         f"🛡️ 【滑點過大・放棄追價】\n"
                         f"{reversed_note}"
                         f"🪙 交易幣種：{sym} ({action})\n"
-                        f"🏷️ 訊號價格：{sig.signal_price}\n"
-                        f"📍 當前現價：{curr_p} (+{adv_slip:.2f}%)\n"
+                        f"🏷️ 訊號價格：{client.fmt_p(sym, sig.signal_price)}\n"
+                        f"📍 當前現價：{client.fmt_p(sym, curr_p)} (+{adv_slip:.1f}%)\n"
                         f"💡 攔截上限：{bot_state['max_entry_slippage_pct']:.1f}%"
                     )
                     return {"success": False, "msg": "滑點過大已攔截"}
@@ -1001,22 +1074,23 @@ async def handle_webhook(request: Request):
             ref_p = sig.signal_price if (sig.signal_price and sig.signal_price > 0) else curr_p
             slip_pct = abs(base_entry - ref_p) / ref_p * 100.0 if ref_p > 0 else 0.0
             slip_note = f"⚠️ 成交滑點：{slip_pct:.2f}%\n" if slip_pct >= SLIPPAGE_WARN_PCT else ""
-            fmt_sl = client.format_price(sym, sig.stop_loss)
+            fmt_entry_str = client.fmt_p(sym, base_entry)
+            fmt_sl_str = client.fmt_p(sym, sig.stop_loss)
             tp_mode_str = "1.5R減40% / 3R減40%" if sig.use_tp2 else "1.5R減半保本+海龜"
             notional_u = abs(actual_amt) * base_entry
-            used_margin = notional_u / lev
+            used_margin = notional_u / max(lev, 1)
             send_line_push(
                 f"{'🟢 【做多 LONG 開倉成功】' if action == 'LONG' else '🔴 【做空 SHORT 開倉成功】'}\n"
                 f"{reversed_note}{slip_note}"
                 f"🪙 交易幣種：{sym} ({lev}x)\n"
-                f"📦 開倉顆數：{abs(actual_amt)} 顆 ({notional_u:.0f}U)\n"
-                f"🔒 佔用保證：{used_margin:.1f}U ({used_margin/account_base*100:.0f}%)\n"
-                f"🏷️ 成交均價：{base_entry}\n"
-                f"🛡️ 標記止損：{fmt_sl}\n"
+                f"📦 持倉數量：{notional_u:.2f}U ({_fmt_qty(abs(actual_amt))}顆)\n"
+                f"🔒 倉位保證：{used_margin:.2f}U (佔{used_margin/account_base*100:.0f}%)\n"
+                f"🏷️ 開倉價格：{fmt_entry_str}\n"
+                f"🛡️ 止損價格：{fmt_sl_str}\n"
                 f"🎯 止盈模式：{tp_mode_str}\n"
                 f"💰 帳戶權益：{account_base:.2f} USDT"
             )
-            return {"success": True, "qty": abs(actual_amt), "stop_loss": fmt_sl}
+            return {"success": True, "qty": abs(actual_amt), "stop_loss": client.format_price(sym, sig.stop_loss)}
         return {"success": False, "msg": f"未知動作: {action}"}
 
 if __name__ == "__main__":
