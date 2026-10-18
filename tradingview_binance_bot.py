@@ -29,11 +29,13 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "SOLUSDT").strip().upper()
 
-DAILY_MAX_DD_PCT = float(os.getenv("DAILY_MAX_DD_PCT", "15.0"))
-EMERGENCY_FLOOR_USDT = float(os.getenv("EMERGENCY_FLOOR_USDT", "0.0"))
+# 預設風控參數 (全幣種智慧雙軌制：單筆保證金上限 20% + 單筆名義倉位上限 3.2倍本金 / 熔斷 40% / 底線 30U / 滑點 1.5%)
+DAILY_MAX_DD_PCT = float(os.getenv("DAILY_MAX_DD_PCT", "40.0"))
+EMERGENCY_FLOOR_USDT = float(os.getenv("EMERGENCY_FLOOR_USDT", "30.0"))
 MARGIN_ALERT_RATIO = float(os.getenv("MARGIN_ALERT_RATIO", "60.0"))
-MAX_ENTRY_SLIPPAGE_PCT = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.8"))
-MAX_MARGIN_PCT_PER_TRADE = float(os.getenv("MAX_MARGIN_PCT_PER_TRADE", "25.0"))
+MAX_ENTRY_SLIPPAGE_PCT = float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "1.5"))
+MAX_MARGIN_PCT_PER_TRADE = float(os.getenv("MAX_MARGIN_PCT_PER_TRADE", "20.0"))
+MAX_NOTIONAL_MULT = float(os.getenv("MAX_NOTIONAL_MULT", "3.2"))
 SLIPPAGE_WARN_PCT = float(os.getenv("SLIPPAGE_WARN_PCT", "0.5"))
 BE_BUFFER_PCT = float(os.getenv("BE_BUFFER_PCT", "0.12"))
 SIGNAL_DEDUP_SEC = float(os.getenv("SIGNAL_DEDUP_SEC", "10.0"))
@@ -52,6 +54,7 @@ bot_state = {
     "emergency_floor_usdt": EMERGENCY_FLOOR_USDT,
     "max_entry_slippage_pct": MAX_ENTRY_SLIPPAGE_PCT,
     "max_margin_pct": MAX_MARGIN_PCT_PER_TRADE,
+    "max_notional_mult": MAX_NOTIONAL_MULT,
     "hourly_push_enabled": False,
     "bound_user_id": LINE_USER_ID,
     "last_symbol": DEFAULT_SYMBOL,
@@ -159,9 +162,9 @@ def build_trade_stats_report(days: int = 7) -> str:
     rows = [r for r in reversed(trade_logs_mem) if r[0] >= cutoff]
   if not rows:
     return (
-        f"📊 【近 {days} 日交易統計週報】\n🕒"
-        f" 統計時間：{now_tw.strftime('%Y-%m-%d %H:%M:%S')}\n📭"
-        " 尚無紀錄：目前尚無已平倉或減倉結算紀錄"
+        f"📊 【近 {days} 日交易統計週報】\n"
+        f"🕒 統計時間：{now_tw.strftime('%m-%d %H:%M')}\n"
+        "📭 目前紀錄：尚無已結算紀錄"
     )
 
   wins = [r[3] for r in rows if r[3] > 0]
@@ -180,14 +183,15 @@ def build_trade_stats_report(days: int = 7) -> str:
   )
   return (
       f"📊 【近 {days} 日交易統計週報】\n"
-      f"🕒 統計時間：{now_tw.strftime('%Y-%m-%d %H:%M')}\n"
-      f"🔢 結算筆數：{len(rows)} 筆 (含減倉與平倉)\n"
-      f"🏆 週總勝率：{wr:.1f}% ({len(wins)}勝 / {len(losses)}敗)\n"
-      f"💰 週總淨利：{'🟢' if total_net >= 0 else '🔴'} {total_net:+.2f} USDT\n"
-      f"⚖️ 均盈虧比：{rr:.2f} (均賺 {avg_w:.2f}U / 均賠 {avg_l:.2f}U)\n"
+      f"🕒 統計時間：{now_tw.strftime('%m-%d %H:%M')}\n"
+      f"🔢 結算筆數：{len(rows)} 筆 (含減倉)\n"
+      f"🏆 週總勝率：{wr:.1f}% ({len(wins)}勝/{len(losses)}敗)\n"
+      f"💰 週總淨利：{'🟢' if total_net >= 0 else '🔴'} {total_net:+.2f} U\n"
+      f"⚖️ 均盈虧比：{rr:.2f}\n"
+      f"📈 均賺均賠：+{avg_w:.1f}U / -{avg_l:.1f}U\n"
       f"🚀 最大單筆：+{max(wins) if wins else 0.0:.2f} USDT\n\n"
-      f"📅 今日結算：{len(td_rows)} 筆 (勝率 {td_wr:.1f}%)\n"
-      f"💵 今日實現：{'🟢' if td_net >= 0 else '🔴'} {td_net:+.2f} USDT"
+      f"📅 今日結算：{len(td_rows)} 筆 (勝率 {td_wr:.0f}%)\n"
+      f"💵 今日實現：{'🟢' if td_net >= 0 else '🔴'} {td_net:+.2f} U"
   )
 
 
@@ -431,7 +435,6 @@ class BinanceClient:
     sym = sym.upper()
     if (sym, lev) in self._leverage_cache:
       return self._leverage_cache[(sym, lev)]
-    # 自動適配幣安各幣種最高槓桿上限 (若部分小幣種上限為 25x/20x，自動平滑降階不報錯)
     candidates = [lev] + [x for x in (50, 40, 30, 25, 20, 15, 10) if x < lev]
     for try_lev in candidates:
       p = {
@@ -593,7 +596,7 @@ def reconcile_state_with_binance(notify_if_repaired: bool = True) -> str:
   try:
     positions = client.get_all_active_positions()
     if not positions:
-      return "📭 重啟檢查：目前無未平倉部位"
+      return "📭 重啟檢查：目前無未平倉位"
     synced, repaired = [], []
     for pos in positions:
       sym, amt, ep = pos["symbol"], pos["amt"], pos["entry_price"]
@@ -601,7 +604,7 @@ def reconcile_state_with_binance(notify_if_repaired: bool = True) -> str:
       bot_state["last_symbol"] = sym
       ex_sl = client.get_existing_sl_price(sym)
       if ex_sl and ex_sl > 0:
-        synced.append(f"{sym}(止損 {ex_sl})")
+        synced.append(f"{sym}({ex_sl})")
       else:
         sl_side = "SELL" if amt > 0 else "BUY"
         fb = EMERGENCY_SL_FALLBACK_PCT / 100.0
@@ -619,23 +622,23 @@ def reconcile_state_with_binance(notify_if_repaired: bool = True) -> str:
           )
         ok = client.set_sl(sym, sl_side, safe_sl)
         repaired.append(
-            f"{sym}(已自動補掛止損 {client.format_price(sym, safe_sl)})"
+            f"{sym}({client.format_price(sym, safe_sl)})"
             if ok
-            else f"{sym}(⚠️補掛失敗)"
+            else f"{sym}(失敗)"
         )
-    msg = f"🔄 狀態對齊：已接管 {len(positions)} 筆持倉"
+    msg = f"🔄 狀態對齊：接管 {len(positions)} 筆持倉"
     if synced:
       msg += f"\n🛡️ 既有止損：{', '.join(synced)}"
     if repaired:
       msg += f"\n🔧 自動補掛：{', '.join(repaired)}"
       if notify_if_repaired:
         send_line_push(
-            f"🛡️ 【重啟狀態對齊・自動補掛止損】\n📦 接管持倉：{len(positions)}"
-            f" 筆\n🔧 自動修復：{', '.join(repaired)}"
+            f"🛡️ 【重啟狀態自動對齊】\n📦 接管持倉：{len(positions)} 筆\n🔧"
+            f" 自動補掛：{', '.join(repaired)}"
         )
     return msg
   except Exception as e:
-    return f"⚠️ 狀態對齊異常: {e}"
+    return f"⚠️ 對齊異常：{e}"
 
 
 def check_emergency_hard_brake(current_eq: float) -> bool:
@@ -658,13 +661,13 @@ def check_emergency_hard_brake(current_eq: float) -> bool:
           pos["entry_price"],
           pos["mark_price"],
       )
-      closed.append(f"{sym}({abs(amt)}顆)")
+      closed.append(sym)
     send_line_push(
-        f"🛑 【最高警報：總權益極限斷路器觸發】\n"
+        f"🛑 【總權益極限斷路觸發】\n"
         f"💰 當前權益：{current_eq:.2f} USDT\n"
         f"🚨 觸發底線：{floor_u:.2f} USDT\n"
         f"✂️ 強制清倉：{', '.join(closed) if closed else '無持倉'}\n"
-        f"🔒 系統狀態：已強制全平並停機，保住剩餘本金！"
+        f"🔒 系統狀態：已全平並停機"
     )
     return True
   return bot_state["emergency_brake_tripped"]
@@ -682,11 +685,11 @@ def check_daily_circuit_breaker(current_eq: float) -> bool:
     bot_state["circuit_breaker_tripped"] = True
     bot_state["trading_enabled"] = False
     send_line_push(
-        f"🚨 【每日最大回撤熔斷啟動】\n"
+        f"🚨 【每日最大回撤熔斷】\n"
         f"📊 今日基準：{daily_start_balance:.2f} USDT\n"
         f"💰 當前權益：{current_eq:.2f} USDT\n"
-        f"📉 當日回撤：-{dd_pct:.2f}% (達上限 -{max_dd:.1f}%)\n"
-        f"🛡️ 防禦動作：已暫停開新倉，明日 08:00 自動重置"
+        f"📉 當日回撤：-{dd_pct:.1f}% (限-{max_dd:.0f}%)\n"
+        f"🛡️ 防禦動作：暫停開倉至明早"
     )
     return True
   return bot_state["circuit_breaker_tripped"]
@@ -694,31 +697,27 @@ def check_daily_circuit_breaker(current_eq: float) -> bool:
 
 def build_status_report(title: str = "📊 【即時帳戶與持倉查詢】") -> str:
   global daily_start_balance
-  now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+  now_str = datetime.now(TW_TZ).strftime("%m-%d %H:%M:%S")
   total_eq, avail, margin_ratio, _ = client.get_equity_and_margin_ratio()
   if daily_start_balance <= 0 and total_eq > 0:
     daily_start_balance = total_eq
-  if bot_state["emergency_floor_usdt"] <= 0 and total_eq > 0:
-    bot_state["emergency_floor_usdt"] = round(total_eq * 0.5, 1)
   positions = client.get_all_active_positions()
 
   if bot_state["emergency_brake_tripped"]:
-    mode_str = f"🛑 極限斷路停機 (底線 {bot_state['emergency_floor_usdt']:.1f}U)"
+    mode_str = f"🛑 斷路停機 ({bot_state['emergency_floor_usdt']:.0f}U)"
   elif bot_state["circuit_breaker_tripped"]:
-    mode_str = f"🚨 熔斷防禦中 (滿 -{bot_state['max_daily_dd_pct']:.0f}%)"
+    mode_str = f"🚨 熔斷防禦 (-{bot_state['max_daily_dd_pct']:.0f}%)"
   elif bot_state["trading_enabled"]:
-    mode_str = "🟢 正常自動接單中"
+    mode_str = "🟢 正常自動接單"
   else:
     mode_str = "⏸️ 已暫停新開倉"
 
   if daily_start_balance > 0 and total_eq > 0:
     diff = total_eq - daily_start_balance
     pct = (diff / daily_start_balance) * 100.0
-    daily_pnl_str = (
-        f"{'🟢' if diff >= 0 else '🔴'} {diff:+.2f} USDT ({pct:+.2f}%)"
-    )
+    daily_pnl_str = f"{'🟢' if diff >= 0 else '🔴'} {diff:+.2f}U ({pct:+.1f}%)"
   else:
-    daily_pnl_str = "⚪ 0.00 USDT (0.00%)"
+    daily_pnl_str = "⚪ 0.00U (0.0%)"
 
   lines = [
       f"{title}",
@@ -728,33 +727,36 @@ def build_status_report(title: str = "📊 【即時帳戶與持倉查詢】") -
       f"💵 可用保證：{avail:.2f} USDT",
       f"📈 今日損益：{daily_pnl_str}",
       (
-          f"🛡️ 防護底線：單筆上限 {bot_state['max_margin_pct']:.0f}% / 日熔斷"
-          f" -{bot_state['max_daily_dd_pct']:.0f}%"
+          f"🛡️ 倉位上限：保證{bot_state['max_margin_pct']:.0f}% /"
+          f" {bot_state['max_notional_mult']:.1f}倍"
+      ),
+      (
+          f"🛑 防護底線：熔斷-{bot_state['max_daily_dd_pct']:.0f}% /"
+          f" 底{bot_state['emergency_floor_usdt']:.0f}U"
       ),
   ]
   if not positions:
     sym = bot_state.get("last_symbol", DEFAULT_SYMBOL)
     lines.append("📭 目前持倉：空手觀望中\n")
-    lines.append(f"🔍 最近幣種：{sym} (現價 {client.get_price(sym)})")
+    lines.append(f"🔍 最近幣種：{sym} ({client.get_price(sym)})")
   else:
     lines.append(
-        f"📦 目前持倉：共 {len(positions)} 筆部位 (保證金率"
-        f" {margin_ratio:.1f}%)"
+        f"📦 目前持倉：{len(positions)} 筆 (維持 {margin_ratio:.0f}%)"
     )
     for pos in positions:
       sym, amt, upnl = pos["symbol"], pos["amt"], pos["upnl"]
       sl_val = (
           client._current_sl.get(sym)
           or client.get_existing_sl_price(sym)
-          or "依幣安條件單"
+          or "依條件單"
       )
       lines.append(
-          f"\n🔸 【{sym}】{'🟢 做多 LONG' if amt > 0 else '🔴 做空 SHORT'}\n"
-          f"   持倉顆數：{abs(amt)} 顆 (約 {pos['notional']:.1f}U)\n"
-          f"   開倉均價：{pos['entry_price']}\n"
-          f"   標記現價：{pos['mark_price']}\n"
-          f"   浮動損益：{'🟢' if upnl >= 0 else '🔴'} {upnl:+.2f} USDT\n"
-          f"   當前止損：{sl_val}"
+          f"\n🔸 【{sym}】{'🟢 做多' if amt > 0 else '🔴 做空'}\n"
+          f"📦 持倉顆數：{abs(amt)} 顆 ({pos['notional']:.0f}U)\n"
+          f"🏷️ 開倉均價：{pos['entry_price']}\n"
+          f"📍 標記現價：{pos['mark_price']}\n"
+          f"💵 浮動損益：{'🟢' if upnl >= 0 else '🔴'} {upnl:+.2f} USDT\n"
+          f"🛡️ 當前止損：{sl_val}"
       )
   return "\n".join(lines)
 
@@ -765,8 +767,6 @@ def background_scheduler():
     init_eq, _, _, _ = client.get_equity_and_margin_ratio()
     if init_eq > 0:
       daily_start_balance = init_eq
-      if bot_state["emergency_floor_usdt"] <= 0:
-        bot_state["emergency_floor_usdt"] = round(init_eq * 0.5, 1)
   except Exception:
     pass
   while True:
@@ -779,8 +779,8 @@ def background_scheduler():
         ):
           bot_state["api_disconnected_alerted"] = True
           send_line_push(
-              "⚠️ 【警告：機器人與幣安交易所連線異常】\n🚨 狀態說明：已連續 3"
-              " 次無法連上幣安 API\n💡 建議操作：請立即開啟幣安 App 檢查倉位！"
+              "⚠️ 【幣安 API 連線異常】\n🚨 連續失敗：已達 3 次\n💡"
+              " 建議操作：請開 App 檢查倉位"
           )
         time.sleep(20)
         continue
@@ -788,7 +788,7 @@ def background_scheduler():
         bot_state["api_disconnected_alerted"] = False
         bot_state["consecutive_api_failures"] = 0
         send_line_push(
-            "🟢 【幣安交易所連線已恢復】\n"
+            "🟢 【幣安連線已恢復】\n"
             f"{reconcile_state_with_binance(notify_if_repaired=False)}"
         )
       bot_state["consecutive_api_failures"] = 0
@@ -798,8 +798,6 @@ def background_scheduler():
       total_eq, avail, margin_ratio, _ = client.get_equity_and_margin_ratio()
       if daily_start_balance <= 0 and total_eq > 0:
         daily_start_balance = total_eq
-      if bot_state["emergency_floor_usdt"] <= 0 and total_eq > 0:
-        bot_state["emergency_floor_usdt"] = round(total_eq * 0.5, 1)
       if total_eq > 0:
         check_daily_circuit_breaker(total_eq)
 
@@ -809,9 +807,8 @@ def background_scheduler():
       ):
         bot_state["last_margin_alert_ts"] = now_ts
         send_line_push(
-            "⚠️ 【高風險！保證金率強平預警】\n🚨"
-            f" 保證金率：{margin_ratio:.1f}%\n💰 帳戶權益：{total_eq:.2f}"
-            " USDT\n💡 請立即輸入「3」減倉或「2」全平降低風險！"
+            f"⚠️ 【保證金率強平預警】\n🚨 保證金率：{margin_ratio:.1f}%\n💰"
+            f" 帳戶權益：{total_eq:.2f} USDT\n💡 建議操作：輸入 3 減倉或 2 全平"
         )
 
       if now_tw.hour == 8 and now_tw.minute < 5 and last_report_date != today_date:
@@ -824,17 +821,16 @@ def background_scheduler():
           pct = (diff / daily_start_balance) * 100.0
           reset_note = "\n🔄 熔斷重置：已恢復自動接單" if was_tripped else ""
           daily_msg = (
-              "🌅 【每日 08:00 帳戶餘額損益日報】\n📅"
-              f" 結算日期：{today_date}\n💰 今日權益：{total_eq:.2f} USDT\n💵"
-              f" 可用保證：{avail:.2f} USDT\n📊"
-              f" 昨日基準：{daily_start_balance:.2f} USDT\n🏆"
-              f" 單日損益：{'🟢' if diff >= 0 else '🔴'} {diff:+.2f} USDT"
-              f" ({pct:+.2f}%){reset_note}"
+              f"🌅 【每日 08:00 損益日報】\n📅 結算日期：{today_date}\n💰"
+              f" 今日權益：{total_eq:.2f} USDT\n💵 可用保證：{avail:.2f}"
+              f" USDT\n📊 昨日基準：{daily_start_balance:.2f} USDT\n🏆"
+              f" 單日損益：{'🟢' if diff >= 0 else '🔴'} {diff:+.2f}U"
+              f" ({pct:+.1f}%){reset_note}"
           )
         else:
           daily_msg = (
-              "🌅 【每日 08:00 帳戶餘額損益日報】\n📅"
-              f" 結算日期：{today_date}\n💰 今日權益：{total_eq:.2f} USDT"
+              f"🌅 【每日 08:00 損益日報】\n📅 結算日期：{today_date}\n💰"
+              f" 今日權益：{total_eq:.2f} USDT"
           )
         send_line_push(daily_msg)
         if total_eq > 0:
@@ -846,9 +842,7 @@ def background_scheduler():
           and last_hourly_key != hour_key
       ):
         send_line_push(
-            build_status_report(
-                title=f"⏰ 【每小時整點巡檢報告 ({now_tw.hour:02d}:00)】"
-            )
+            build_status_report(title=f"⏰ 【整點巡檢報告 ({now_tw.hour:02d}:00)】")
         )
         last_hourly_key = hour_key
       time.sleep(25)
@@ -864,9 +858,8 @@ async def lifespan(app: FastAPI):
       LINE_USER_ID or bot_state.get("bound_user_id")
   ):
     send_line_push(
-        "🤖 【幣安合約機器人 v4.2 終極裝甲版】已上線！\n"
-        f"{reconcile_summary}\n"
-        "💡 輸入「0」查看選單，輸入「9」查看統計週報。"
+        f"🤖 【幣安機器人 v4.4】已上線\n{reconcile_summary}\n💡 輸入 0"
+        " 看選單，輸入 9 看週報"
     )
   yield
 
@@ -890,7 +883,7 @@ class Signal(BaseModel):
 def index():
   return {
       "status": "online",
-      "version": "v4.2 Ultimate Armor",
+      "version": "v4.4 Ultimate Armor",
       "trading_enabled": bot_state["trading_enabled"],
   }
 
@@ -913,7 +906,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
   if not bot_state.get("bound_user_id") and user_id:
     bot_state["bound_user_id"] = user_id
   if LINE_USER_ID and user_id != LINE_USER_ID:
-    return "⛔ 權限不足：僅限本人帳號操控。"
+    return "⛔ 權限不足：僅限本人操控"
 
   if text in ("1", "查詢", "狀態", "倉位", "餘額", "查帳"):
     return build_status_report(title="📊 【即時帳戶與持倉查詢】")
@@ -935,7 +928,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
     if not positions:
       sym_clean = target_sym or bot_state.get("last_symbol", DEFAULT_SYMBOL)
       client.cancel_all(sym_clean)
-      return f"📭 目前無開倉部位（已清理 {sym_clean} 掛單）。"
+      return f"📭 目前無持倉 (已清 {sym_clean} 掛單)"
     closed = []
     for pos in positions:
       sym, amt = pos["symbol"], pos["amt"]
@@ -949,10 +942,10 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
           pos["entry_price"],
           pos["mark_price"],
       )
-      closed.append(f"🔸 {sym}：全平 {abs(amt)} 顆 ({pos['upnl']:+.2f}U)")
+      closed.append(f"🔸 {sym}：{abs(amt)}顆 ({pos['upnl']:+.2f}U)")
     total_eq, _, _ = client.get_equity()
     return (
-        "🚨 【LINE 一鍵全平倉完畢】\n"
+        "🚨 【一鍵全平倉執行完畢】\n"
         + "\n".join(closed)
         + f"\n💰 最新權益：{total_eq:.2f} USDT"
     )
@@ -960,7 +953,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
   if text in ("3", "減半", "平半", "減倉"):
     positions = client.get_all_active_positions()
     if not positions:
-      return "📭 目前無持倉可供減半。"
+      return "📭 目前無持倉可供減半"
     res = []
     for pos in positions:
       sym, amt, min_not = (
@@ -977,13 +970,13 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
         pnl_est = record_trade_log(
             sym, "MANUAL_HALF", amt, hq, pos["entry_price"], pos["mark_price"]
         )
-        res.append(f"🔸 {sym}：已減倉 {hq} 顆 ({pnl_est:+.2f}U)，剩 {rq} 顆")
-    return "✂️ 【LINE 手動減倉 50%】\n" + "\n".join(res)
+        res.append(f"🔸 {sym}：{hq}顆 ({pnl_est:+.2f}U)")
+    return "✂️ 【手動減倉 50% 結果】\n" + "\n".join(res)
 
   if text in ("4", "保本", "移保本"):
     positions = client.get_all_active_positions()
     if not positions:
-      return "📭 目前無持倉可設定保本。"
+      return "📭 目前無持倉可設保本"
     res = []
     for pos in positions:
       sym, amt, ep, mp = (
@@ -998,38 +991,35 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
           else ep * (1.0 - BE_BUFFER_PCT / 100.0)
       )
       if (amt > 0 and mp <= be_p) or (amt < 0 and mp >= be_p):
-        res.append(
-            f"🔸 {sym}：現價 ({mp}) 尚未超過保本價"
-            f" ({client.format_price(sym, be_p)})"
-        )
+        res.append(f"🔸 {sym}：現價未超過保本價")
       else:
         client.cancel_all(sym)
         ok = client.set_sl(sym, "SELL" if amt > 0 else "BUY", be_p)
         res.append(
-            f"🔸 {sym}：{'✅ 已移至保本價 ' + str(client.format_price(sym, be_p)) if ok else '❌ 掛單失敗'}"
+            f"🔸 {sym}：{'✅ 保本 ' + str(client.format_price(sym, be_p)) if ok else '❌ 掛單失敗'}"
         )
-    return "🛡️ 【LINE 手動移保本】\n" + "\n".join(res)
+    return "🛡️ 【手動移至保本結果】\n" + "\n".join(res)
 
   m_sl = re.match(r"^(?:5|止損|改止損|SL)\s+([0-9.]+)$", upper_text)
   if m_sl:
     new_sl = float(m_sl.group(1))
     positions = client.get_all_active_positions()
     if not positions:
-      return "📭 目前無持倉，無法設定止損。"
+      return "📭 目前無持倉可改止損"
     sym, amt = positions[0]["symbol"], positions[0]["amt"]
     client.cancel_all(sym)
     ok = client.set_sl(sym, "SELL" if amt > 0 else "BUY", new_sl)
     return (
-        f"✅ 已將 {sym} 止損更新為：{client.format_price(sym, new_sl)}"
+        f"🛡️ {sym} 止損已設：{client.format_price(sym, new_sl)}"
         if ok
-        else f"❌ 更新 {sym} 止損失敗。"
+        else f"❌ {sym} 止損更新失敗"
     )
 
   if text in ("6", "暫停", "停止", "暫停開倉"):
     bot_state["trading_enabled"] = False
     return (
-        "⏸️"
-        " 【已暫停自動開新倉】\n既有持倉止損與止盈保護仍照常運作。輸入「7」可恢復。"
+        "⏸️ 【已暫停自動開新倉】\n🛡️ 既有止損：照常運作\n💡 恢復指令：輸入 7"
+        " 即可恢復"
     )
 
   if text in ("7", "恢復", "啟動", "開始", "恢復開倉"):
@@ -1039,15 +1029,13 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
     eq, _, _ = client.get_equity()
     if eq > 0:
       daily_start_balance = eq
-      if bot_state["emergency_floor_usdt"] >= eq:
-        bot_state["emergency_floor_usdt"] = round(eq * 0.5, 1)
-    return "🟢 【已恢復自動交易】\n機器人已重新開始接收所有進出場訊號！"
+    return "🟢 【已恢復自動開新倉】\n🤖 系統狀態：正常接收訊號中"
 
   if text in ("8", "整點推播", "每小時推播"):
     bot_state["hourly_push_enabled"] = not bot_state["hourly_push_enabled"]
     return (
         "⏰"
-        f" 【每小時整點推播】：{'🟢 已開啟' if bot_state['hourly_push_enabled'] else '⏸️ 已關閉'}"
+        f" 整點推播：{'🟢 已開啟' if bot_state['hourly_push_enabled'] else '⏸️ 已關閉'}"
     )
 
   if text in ("9", "統計", "週報", "戰績", "報表", "歷史"):
@@ -1059,51 +1047,50 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
   m_cb = re.match(r"^(?:熔斷|回撤|DD)\s+([0-9.]+)$", upper_text)
   if m_cb:
     bot_state["max_daily_dd_pct"] = max(1.0, min(95.0, float(m_cb.group(1))))
-    return f"🛡️ 【每日最大回撤熔斷】已設為：-{bot_state['max_daily_dd_pct']:.1f}%"
+    return f"🛡️ 每日回撤熔斷：-{bot_state['max_daily_dd_pct']:.1f}%"
 
   m_fl = re.match(r"^(?:底線|斷路|FLOOR)\s+([0-9.]+)$", upper_text)
   if m_fl:
     bot_state["emergency_floor_usdt"] = max(0.0, float(m_fl.group(1)))
     bot_state["emergency_brake_tripped"] = False
-    return (
-        "🛑"
-        f" 【總權益極限斷路底線】已設為：{bot_state['emergency_floor_usdt']:.2f}"
-        " USDT"
-    )
+    return f"🛑 極限斷路底線：{bot_state['emergency_floor_usdt']:.1f} USDT"
 
   m_slp = re.match(r"^(?:滑點|SLIP)\s+([0-9.]+)$", upper_text)
   if m_slp:
     bot_state["max_entry_slippage_pct"] = max(
         0.1, min(10.0, float(m_slp.group(1)))
     )
-    return (
-        "🛡️"
-        f" 【開倉前滑點攔截上限】已設為：{bot_state['max_entry_slippage_pct']:.2f}%"
-    )
+    return f"🛡️ 開倉滑點上限：{bot_state['max_entry_slippage_pct']:.2f}%"
 
   m_mg = re.match(r"^(?:上限|保證金|MARGIN)\s+([0-9.]+)$", upper_text)
   if m_mg:
     bot_state["max_margin_pct"] = max(5.0, min(100.0, float(m_mg.group(1))))
-    return f"🛡️ 【單筆最大保證金佔比】已設為：{bot_state['max_margin_pct']:.1f}%"
+    return f"🛡️ 單筆保證上限：{bot_state['max_margin_pct']:.1f}%"
+
+  m_nt = re.match(r"^(?:倍數|名義|MULT)\s+([0-9.]+)$", upper_text)
+  if m_nt:
+    bot_state["max_notional_mult"] = max(0.5, min(20.0, float(m_nt.group(1))))
+    return f"🛡️ 單筆名義上限：{bot_state['max_notional_mult']:.1f} 倍本金"
 
   if upper_text in ("ID", "USERID", "綁定"):
-    return f"🔑 你的 LINE_USER_ID：\n{user_id}"
+    return f"🔑 你的 LINE ID：\n{user_id}"
 
   return (
-      "🤖 【幣安機器人 v4.2 遙控選單】\n"
-      "🔹 輸入「1」查詢權益、今日損益與持倉\n"
-      "🔹 輸入「2」🚨 一鍵市價全平所有持倉\n"
-      "🔹 輸入「3」減倉 50% / 輸入「4」移保本\n"
-      "🔹 輸入「止損 價格」修改止損價\n"
-      "🔹 輸入「6」暫停 / 輸入「7」恢復開倉\n"
-      "🔹 輸入「9」📊 查看近 7 日戰績統計週報\n"
-      "🔹 輸入「10」🔄 巡檢倉位並自動補掛止損\n"
-      f"🔹 輸入「上限 數字」(單筆保證金 {bot_state['max_margin_pct']:.0f}%)\n"
-      f"🔹 輸入「熔斷 數字」(日回撤 -{bot_state['max_daily_dd_pct']:.0f}%)\n"
-      "🔹 輸入「底線 金額」(強平底線"
-      f" {bot_state['emergency_floor_usdt']:.1f}U)\n"
-      "🔹 輸入「滑點 數字」(滑點攔截"
-      f" {bot_state['max_entry_slippage_pct']:.1f}%)"
+      "🤖 【幣安機器人 v4.4 選單】\n"
+      "🔹 「1」查詢帳戶與持倉狀態\n"
+      "🔹 「2」一鍵市價全平所有倉\n"
+      "🔹 「3」手動將持倉減倉 50%\n"
+      "🔹 「4」手動將止損移至保本\n"
+      "🔹 「6」暫停 / 「7」恢復開倉\n"
+      "🔹 「8」開關每小時整點推播\n"
+      "🔹 「9」查看近 7 日統計週報\n"
+      "🔹 「10」巡檢倉位並補掛止損\n"
+      "🔹 「止損 價格」修改止損價\n"
+      f"🔹 「上限 數字」保證金 {bot_state['max_margin_pct']:.0f}%\n"
+      f"🔹 「倍數 數字」倉位限 {bot_state['max_notional_mult']:.1f}倍\n"
+      f"🔹 「熔斷 數字」日回撤 -{bot_state['max_daily_dd_pct']:.0f}%\n"
+      f"🔹 「底線 金額」強平線 {bot_state['emergency_floor_usdt']:.0f}U\n"
+      f"🔹 「滑點 數字」滑點限 {bot_state['max_entry_slippage_pct']:.1f}%"
   )
 
 
@@ -1169,18 +1156,18 @@ async def handle_webhook(request: Request):
       ) / 100.0
       close_qty = client.format_qty(sym, abs(pos_amt) * pct)
       rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
-      realized_note = ""
       if 0 < close_qty < abs(pos_amt) and (rem_qty * curr_p >= min_not):
         client.order(sym, side, close_qty, reduce_only=True)
         net_u = record_trade_log(
             sym, "TP1", pos_amt, close_qty, entry_price, curr_p
         )
-        tp_note = (
-            f"已減倉 {int(round(pct*100))}% ({close_qty} 顆)，尾倉 {rem_qty} 顆"
+        tp_lines = (
+            f"✂️ 減倉顆數：{close_qty} 顆 ({int(round(pct*100))}%)\n"
+            f"📦 剩餘尾倉：{rem_qty} 顆\n"
+            f"💵 落袋損益：🟢 {net_u:+.2f} USDT\n"
         )
-        realized_note = f"💵 落袋損益：🟢 {net_u:+.2f} USDT\n"
       else:
-        tp_note = f"尾倉拆減低於 {min_not}U，保留 {abs(pos_amt)} 顆直接移保本"
+        tp_lines = f"📦 保留全倉：{abs(pos_amt)} 顆直接移保本\n"
 
       be_buf = (
           entry_price * (1.0 + BE_BUFFER_PCT / 100.0)
@@ -1202,13 +1189,15 @@ async def handle_webhook(request: Request):
           )
         send_line_push(
             f"🛡️ 【TP1 回落保護全平】\n🪙 交易幣種：{sym}\n⚠️"
-            " 現價已穿過保本價，自動市價全平鎖利！"
+            " 觸發原因：現價穿過保本價"
         )
         return {"success": True, "msg": "已全平保護"}
       send_line_push(
-          f"🎯 【1.5R TP1 一階止盈 & 保本】\n🪙 交易幣種：{sym}\n✂️"
-          f" 執行動作：{tp_note}\n{realized_note}🏷️ 開倉均價：{entry_price}\n🛡️"
-          f" 保本止損：{client.format_price(sym, target_sl)}"
+          f"🎯 【1.5R TP1 止盈與保本】\n"
+          f"🪙 交易幣種：{sym}\n"
+          f"{tp_lines}"
+          f"🏷️ 開倉均價：{entry_price}\n"
+          f"🛡️ 保本止損：{client.format_price(sym, target_sl)}"
       )
       return {"success": True, "msg": "TP1完成"}
 
@@ -1242,16 +1231,18 @@ async def handle_webhook(request: Request):
             else 0.0
         )
         rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
-      realized_note = ""
       if close_qty > 0 and (close_qty * curr_p >= min_not):
         client.order(sym, side, close_qty, reduce_only=True)
         net_u = record_trade_log(
             sym, "TP2", pos_amt, close_qty, entry_price, curr_p
         )
-        tp2_note = f"再減倉 {close_qty} 顆，留尾倉 {rem_qty} 顆衝刺"
-        realized_note = f"💵 落袋損益：🟢 {net_u:+.2f} USDT\n"
+        tp2_lines = (
+            f"✂️ 再減顆數：{close_qty} 顆\n"
+            f"📦 剩餘尾倉：{rem_qty} 顆\n"
+            f"💵 落袋損益：🟢 {net_u:+.2f} USDT\n"
+        )
       else:
-        tp2_note = f"保留尾倉 {abs(pos_amt)} 顆跟著海龜線衝刺"
+        tp2_lines = f"📦 保留尾倉：{abs(pos_amt)} 顆衝刺\n"
       if sig.stop_loss and sig.stop_loss > 0:
         client.cancel_all(sym)
         if not client.set_sl(sym, side, sig.stop_loss):
@@ -1259,9 +1250,11 @@ async def handle_webhook(request: Request):
           if abs(rem_amt) > 0:
             client.order(sym, side, abs(rem_amt), reduce_only=True)
       send_line_push(
-          f"🚀 【3.0R TP2 二階止盈成功】\n🪙 交易幣種：{sym}\n✂️"
-          f" 執行動作：{tp2_note}\n{realized_note}🏷️ 開倉均價：{entry_price} |"
-          f" 現價：{curr_p}\n🛡️ 上推止損：{client._current_sl.get(sym, '保本止損')}"
+          f"🚀 【3.0R TP2 二階止盈】\n"
+          f"🪙 交易幣種：{sym}\n"
+          f"{tp2_lines}"
+          f"🏷️ 開倉均價：{entry_price}\n"
+          f"🛡️ 上推止損：{client._current_sl.get(sym, '保本止損')}"
       )
       return {"success": True, "msg": "TP2完成"}
 
@@ -1285,18 +1278,13 @@ async def handle_webhook(request: Request):
               sym, "TRAIL_SL", pos_amt, abs(rem_amt), entry_price, curr_p
           )
         send_line_push(
-            f"🛡️ 【海龜移動止損觸發出場】\n🪙 交易幣種：{sym}\n🏷️"
+            f"🛡️ 【移動止損觸發出場】\n🪙 交易幣種：{sym}\n📍"
             f" 出場價格：{curr_p}\n💵 結算損益：{net_u:+.2f} USDT"
         )
         return {"success": True, "msg": "已市價出場"}
       fmt_sl = client.format_price(sym, sig.stop_loss)
-      send_line_push(
-          f"🐢 【海龜移動止損上推更新】\n🪙 交易幣種：{sym}"
-          f" ({'做多 LONG' if pos_amt > 0 else '做空 SHORT'})\n📦"
-          f" 當前持倉：{abs(pos_amt)} 顆 (均價 {entry_price})\n🛡️"
-          f" 最新止損：{fmt_sl}"
-      )
-      return {"success": True, "msg": f"止損已更新至 {fmt_sl}"}
+      logger.info(f"🐢 {sym} 海龜移動止損已靜默更新至 {fmt_sl}")
+      return {"success": True, "msg": f"止損已靜默更新至 {fmt_sl}"}
 
     if action in ("CLOSE_LONG", "CLOSE_SHORT"):
       pos_amt, entry_price = client.get_position_info(sym)
@@ -1316,11 +1304,13 @@ async def handle_webhook(request: Request):
         total_eq, _, _ = client.get_equity()
         check_daily_circuit_breaker(total_eq)
         send_line_push(
-            f"🏁 【止損 / 趨勢出場平倉完成】\n🪙 交易幣種：{sym}"
-            f" ({'多單平倉' if pos_amt > 0 else '空單平倉'})\n📦"
-            f" 平倉顆數：{abs(pos_amt)} 顆\n🏷️ 進場均價：{entry_price} |"
-            f" 出場：{curr_p}\n💵 本筆損益：{'🟢' if net_u >= 0 else '🔴'}"
-            f" {net_u:+.2f} USDT\n💰 帳戶權益：{total_eq:.2f} USDT"
+            f"🏁 【止損 / 趨勢平倉完成】\n"
+            f"🪙 交易幣種：{sym} ({'多單' if pos_amt > 0 else '空單'})\n"
+            f"📦 平倉顆數：{abs(pos_amt)} 顆\n"
+            f"🏷️ 進場均價：{entry_price}\n"
+            f"📍 出場價格：{curr_p}\n"
+            f"💵 本筆損益：{'🟢' if net_u >= 0 else '🔴'} {net_u:+.2f} USDT\n"
+            f"💰 帳戶權益：{total_eq:.2f} USDT"
         )
         return {"success": True, "msg": "已平倉"}
       client.cancel_all(sym)
@@ -1343,7 +1333,7 @@ async def handle_webhook(request: Request):
         rev_pnl = record_trade_log(
             sym, "REVERSE_CLOSE", pos_amt, abs(pos_amt), old_entry, curr_p
         )
-        reversed_note = f"🔄 反手平舊倉：{abs(pos_amt)} 顆 ({rev_pnl:+.2f}U)\n"
+        reversed_note = f"🔄 反手平倉：{abs(pos_amt)}顆 ({rev_pnl:+.2f}U)\n"
         time.sleep(0.4)
 
       total_eq, avail, _ = client.get_equity()
@@ -1353,17 +1343,17 @@ async def handle_webhook(request: Request):
           or not bot_state["trading_enabled"]
       ):
         reason = (
-            "已觸發極限斷路器"
+            "已觸發極限斷路"
             if bot_state["emergency_brake_tripped"]
             else (
-                "今日回撤達熔斷上限"
+                "今日達熔斷上限"
                 if bot_state["circuit_breaker_tripped"]
-                else "目前為暫停開倉模式"
+                else "目前暫停開新倉"
             )
         )
         send_line_push(
-            f"⏸️ 【收到 {sym} {action} 訊號，已略過新進場】\n{reversed_note}🛡️"
-            f" 略過原因：{reason}\n💡 輸入「7」可恢復開倉"
+            f"⏸️ 【收到訊號・略過新進場】\n{reversed_note}🪙 交易幣種：{sym}"
+            f" ({action})\n🛡️ 略過原因：{reason}\n💡 恢復指令：輸入 7 恢復"
         )
         return {"success": True, "msg": reason}
 
@@ -1381,10 +1371,12 @@ async def handle_webhook(request: Request):
         )
         if adv_slip > bot_state["max_entry_slippage_pct"]:
           send_line_push(
-              f"🛡️ 【滑點保護攔截・放棄追價】\n{reversed_note}🪙"
-              f" 交易幣種：{sym} ({action})\n🏷️ 訊號價格：{sig.signal_price} |"
-              f" 現價：{curr_p} (+{adv_slip:.2f}%)\n💡 滑點超過上限"
-              f" ({bot_state['max_entry_slippage_pct']:.1f}%)，放棄進場"
+              f"🛡️ 【滑點過大・放棄追價】\n"
+              f"{reversed_note}"
+              f"🪙 交易幣種：{sym} ({action})\n"
+              f"🏷️ 訊號價格：{sig.signal_price}\n"
+              f"📍 當前現價：{curr_p} (+{adv_slip:.2f}%)\n"
+              f"💡 攔截上限：{bot_state['max_entry_slippage_pct']:.1f}%"
           )
           return {"success": False, "msg": "滑點過大已攔截"}
 
@@ -1401,19 +1393,21 @@ async def handle_webhook(request: Request):
           if (risk_usd / safe_dist * curr_p < min_not)
           else 0.0,
       )
+      # 智慧雙軌制：同時限制「單筆最大保證金佔比(20%)」與「單筆最大名義倉位倍數(3.2倍本金)」
       max_margin_qty = (
           account_base * (bot_state["max_margin_pct"] / 100.0) * lev
       ) / curr_p
+      max_notional_qty = (account_base * bot_state["max_notional_mult"]) / curr_p
       avail_cap_qty = (
           (avail if avail > 0 else account_base) * lev * 0.95
       ) / curr_p
       target_qty = client.format_qty(
-          sym, min(raw_qty, max_margin_qty, avail_cap_qty)
+          sym, min(raw_qty, max_margin_qty, max_notional_qty, avail_cap_qty)
       )
       if target_qty <= 0 or (target_qty * curr_p) < min_not:
         send_line_push(
-            f"⚠️ 【{sym} {action} 保證金不足略過】\n💵 可用保證：{avail:.2f}"
-            " USDT"
+            f"⚠️ 【保證金不足略過開倉】\n🪙 交易幣種：{sym} ({action})\n💵"
+            f" 可用保證：{avail:.2f} USDT"
         )
         return {"success": False, "msg": "可用保證金不足"}
 
@@ -1424,7 +1418,7 @@ async def handle_webhook(request: Request):
       client.cancel_all(sym)
       order_res = client.order(sym, side, target_qty)
       if not isinstance(order_res, dict) or "orderId" not in order_res:
-        send_line_push(f"❌ 【{sym} {action} 開倉失敗】\n⚠️ 回應：{order_res}")
+        send_line_push(f"❌ 【{sym} 開倉失敗】\n⚠️ 錯誤訊息：{order_res}")
         raise HTTPException(status_code=400, detail=f"開倉失敗: {order_res}")
 
       actual_amt, actual_entry = client.verify_position_opened(
@@ -1432,14 +1426,14 @@ async def handle_webhook(request: Request):
       )
       if abs(actual_amt) <= 0:
         send_line_push(
-            f"🚨 【{sym} {action} 異常警報】市價單送出但未偵測到持倉！"
+            f"🚨 【{sym} 異常警報】\n⚠️ 狀態說明：市價單未偵測到持倉"
         )
         return {"success": False, "msg": "未偵測到持倉"}
 
       base_entry = actual_entry if actual_entry > 0 else curr_p
       if not client.set_sl(sym, sl_side, sig.stop_loss):
         client.order(sym, sl_side, abs(actual_amt), reduce_only=True)
-        send_line_push(f"🚨 【{sym} {action} 止損掛單失敗・已緊急平倉保護】")
+        send_line_push(f"🚨 【{sym} 止損掛單失敗】\n🛡️ 保護動作：已緊急平倉保護")
         raise HTTPException(status_code=400, detail="止損設定失敗已平倉")
 
       ref_p = (
@@ -1449,23 +1443,25 @@ async def handle_webhook(request: Request):
       )
       slip_pct = abs(base_entry - ref_p) / ref_p * 100.0 if ref_p > 0 else 0.0
       slip_note = (
-          f"⚠️ 滑點提醒：實際成交滑點 {slip_pct:.2f}%\n"
+          f"⚠️ 成交滑點：{slip_pct:.2f}%\n"
           if slip_pct >= SLIPPAGE_WARN_PCT
           else ""
       )
       fmt_sl = client.format_price(sym, sig.stop_loss)
       tp_mode_str = (
-          "1.5R減40%保本 / 3R減40%"
+          "1.5R減40% / 3R減40%"
           if sig.use_tp2
-          else "1.5R減倉50%保本 + 海龜移動止損"
+          else "1.5R減半保本+海龜"
       )
-      used_margin = (abs(actual_amt) * base_entry) / lev
+      notional_u = abs(actual_amt) * base_entry
+      used_margin = notional_u / lev
       send_line_push(
           f"{'🟢 【做多 LONG 開倉成功】' if action == 'LONG' else '🔴 【做空 SHORT 開倉成功】'}\n"
           f"{reversed_note}{slip_note}"
           f"🪙 交易幣種：{sym} ({lev}x)\n"
-          f"📦 開倉顆數：{abs(actual_amt)} 顆 (約"
-          f" {abs(actual_amt) * base_entry:.1f}U / 保證金 {used_margin:.1f}U)\n"
+          f"📦 開倉顆數：{abs(actual_amt)} 顆 ({notional_u:.0f}U)\n"
+          f"🔒 佔用保證：{used_margin:.1f}U"
+          f" ({used_margin/account_base*100:.0f}%)\n"
           f"🏷️ 成交均價：{base_entry}\n"
           f"🛡️ 標記止損：{fmt_sl}\n"
           f"🎯 止盈模式：{tp_mode_str}\n"
