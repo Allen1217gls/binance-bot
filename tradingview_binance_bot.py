@@ -56,6 +56,7 @@ bot_state = {
 }
 
 recent_signals_cache: Dict[str, float] = {}
+last_entry_ts: Dict[str, float] = {}
 trade_logs_mem: List[Tuple[str, str, str, float]] = []
 
 def _disp_sym(sym: str) -> str:
@@ -697,7 +698,7 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=background_scheduler, daemon=True).start()
     if LINE_CHANNEL_ACCESS_TOKEN and (LINE_USER_ID or bot_state.get("bound_user_id")):
         send_line_push(
-            f"🤖 【幣安機器人 v4.5】已上線\n"
+            f"🤖 【幣安機器人 v4.6】已上線\n"
             f"{reconcile_summary}\n"
             f"💡 快捷指令：輸入 0 查看選單"
         )
@@ -718,7 +719,7 @@ class Signal(BaseModel):
 
 @app.get("/")
 def index():
-    return {"status": "online", "version": "v4.5 Ultimate Armor", "trading_enabled": bot_state["trading_enabled"]}
+    return {"status": "online", "version": "v4.6 Ultimate Armor", "trading_enabled": bot_state["trading_enabled"]}
 
 @app.get("/test-binance")
 def test_binance():
@@ -763,13 +764,14 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
         res = []
         for pos in positions:
             sym, amt, min_not = pos["symbol"], pos["amt"], client.get_min_notional(pos["symbol"])
+            ref_mp = pos["mark_price"] if pos["mark_price"] > 0 else pos["entry_price"]
             hq = client.format_qty(sym, abs(amt) * 0.5)
             rq = client.format_qty(sym, abs(amt) - hq)
-            if hq <= 0 or (rq * pos["mark_price"] < min_not):
+            if hq <= 0 or (rq * ref_mp < min_not):
                 res.append(f"⚠️ 無法拆半：{_disp_sym(sym)} (倉位過小)")
             else:
                 client.order(sym, "SELL" if amt > 0 else "BUY", hq, reduce_only=True)
-                pnl_est = record_trade_log(sym, "MANUAL_HALF", amt, hq, pos["entry_price"], pos["mark_price"])
+                pnl_est = record_trade_log(sym, "MANUAL_HALF", amt, hq, pos["entry_price"], ref_mp)
                 res.append(f"✂️ 已減半倉：{_disp_sym(sym)} ({pnl_est:+.2f}U)")
         return "✂️ 【手動減倉 50% 結果】\n" + "\n".join(res)
 
@@ -872,7 +874,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
         return f"🔑 你的 LINE ID：\n{user_id}"
 
     return (
-        "🤖 【幣安機器人 v4.5 選單】\n"
+        "🤖 【幣安機器人 v4.6 選單】\n"
         "🔹 「1」查詢帳戶與持倉狀態\n"
         "🔹 「2」一鍵市價全平所有倉\n"
         "🔹 「3」手動將持倉減倉 50%\n"
@@ -928,7 +930,8 @@ async def handle_webhook(request: Request):
             pos_amt, entry_price = client.get_position_info(sym)
             if abs(pos_amt) <= 0 or ("LONG" in action and pos_amt < 0) or ("SHORT" in action and pos_amt > 0):
                 return {"success": True, "msg": "無對應持倉，略過TP1"}
-            side, curr_p, min_not = ("SELL" if "LONG" in action else "BUY"), client.get_price(sym), client.get_min_notional(sym)
+            side, min_not = ("SELL" if "LONG" in action else "BUY"), client.get_min_notional(sym)
+            curr_p = client.get_price(sym) or entry_price
             pct = (sig.close_pct if (sig.close_pct and 0 < sig.close_pct < 100) else 50.0) / 100.0
             close_qty = client.format_qty(sym, abs(pos_amt) * pct)
             rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
@@ -969,7 +972,8 @@ async def handle_webhook(request: Request):
             pos_amt, entry_price = client.get_position_info(sym)
             if abs(pos_amt) <= 0 or ("LONG" in action and pos_amt < 0) or ("SHORT" in action and pos_amt > 0):
                 return {"success": True, "msg": "無對應持倉，略過TP2"}
-            side, curr_p, min_not = ("SELL" if "LONG" in action else "BUY"), client.get_price(sym), client.get_min_notional(sym)
+            side, min_not = ("SELL" if "LONG" in action else "BUY"), client.get_min_notional(sym)
+            curr_p = client.get_price(sym) or entry_price
             pct = (sig.close_pct if (sig.close_pct and 0 < sig.close_pct < 100) else 66.67) / 100.0
             close_qty = client.format_qty(sym, abs(pos_amt) * pct)
             rem_qty = client.format_qty(sym, abs(pos_amt) - close_qty)
@@ -1019,7 +1023,7 @@ async def handle_webhook(request: Request):
             if cur_sl and cur_sl > 0:
                 if (pos_amt > 0 and new_sl <= cur_sl) or (pos_amt < 0 and new_sl >= cur_sl):
                     return {"success": True, "msg": f"既有止損 ({cur_sl}) 更有利，略過倒退更新"}
-            sl_side, curr_p = ("SELL" if pos_amt > 0 else "BUY"), client.get_price(sym)
+            sl_side, curr_p = ("SELL" if pos_amt > 0 else "BUY"), (client.get_price(sym) or entry_price)
             client.cancel_all(sym)
             if not client.set_sl(sym, sl_side, new_sl):
                 rem_amt, _ = client.get_position_info(sym)
@@ -1034,12 +1038,15 @@ async def handle_webhook(request: Request):
             return {"success": True, "msg": f"止損已靜默更新至 {fmt_sl}"}
 
         if action in ("CLOSE_LONG", "CLOSE_SHORT"):
+            # 防護同秒反手競爭：若 6 秒內剛完成新開倉，略過延遲抵達的舊平倉訊號，避免誤刪新倉止損單
+            if time.time() - last_entry_ts.get(sym, 0.0) < 6.0:
+                return {"success": True, "msg": "剛完成反手開倉，略過延遲抵達之舊平倉指令"}
             pos_amt, entry_price = client.get_position_info(sym)
             if abs(pos_amt) > 0:
                 if ("LONG" in action and pos_amt < 0) or ("SHORT" in action and pos_amt > 0):
                     return {"success": True, "msg": "方向已變"}
                 client.cancel_all(sym)
-                curr_p = client.get_price(sym)
+                curr_p = client.get_price(sym) or entry_price
                 client.order(sym, "SELL" if pos_amt > 0 else "BUY", abs(pos_amt), reduce_only=True)
                 net_u = record_trade_log(sym, "STOP_EXIT", pos_amt, abs(pos_amt), entry_price, curr_p)
                 total_eq, _, _ = client.get_equity()
@@ -1060,13 +1067,15 @@ async def handle_webhook(request: Request):
         if action in ("LONG", "SHORT"):
             pos_amt, old_entry = client.get_position_info(sym)
             curr_p, min_not = client.get_price(sym), client.get_min_notional(sym)
+            if curr_p <= 0 and sig.signal_price and sig.signal_price > 0:
+                curr_p = client.format_price(sym, sig.signal_price)
             if ((action == "LONG" and pos_amt > 0) or (action == "SHORT" and pos_amt < 0)) and (abs(pos_amt) * curr_p >= min_not):
                 return {"success": True, "msg": "已有同向持倉"}
             reversed_note = ""
             if abs(pos_amt) > 0:
                 client.cancel_all(sym)
                 client.order(sym, "BUY" if pos_amt < 0 else "SELL", abs(pos_amt), reduce_only=True)
-                rev_pnl = record_trade_log(sym, "REVERSE_CLOSE", pos_amt, abs(pos_amt), old_entry, curr_p)
+                rev_pnl = record_trade_log(sym, "REVERSE_CLOSE", pos_amt, abs(pos_amt), old_entry, curr_p or old_entry)
                 reversed_note = f"🔄 反手平倉：{_fmt_qty(abs(pos_amt))}顆 ({rev_pnl:+.2f}U)\n"
                 time.sleep(0.4)
 
@@ -1129,6 +1138,7 @@ async def handle_webhook(request: Request):
                 send_line_push(f"🚨 【{sym} 止損掛單失敗】\n🛡️ 保護動作：已緊急平倉保護")
                 raise HTTPException(status_code=400, detail="止損設定失敗已平倉")
 
+            last_entry_ts[sym] = time.time()
             ref_p = sig.signal_price if (sig.signal_price and sig.signal_price > 0) else curr_p
             slip_pct = abs(base_entry - ref_p) / ref_p * 100.0 if ref_p > 0 else 0.0
             slip_note = f"⚠️ 成交滑點：{slip_pct:.2f}%\n" if slip_pct >= SLIPPAGE_WARN_PCT else ""
