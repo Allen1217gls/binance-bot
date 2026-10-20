@@ -25,6 +25,12 @@ FUTURES_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://f
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
+# 免費無上限推播通道：Bark (已預填妳截圖中的專屬金鑰) 與 Discord Webhook
+BARK_KEY = os.getenv("BARK_KEY", "zp4tRQ2xtKJPhfhYM3qXJm").strip()
+BARK_SERVER_URL = os.getenv("BARK_SERVER_URL", "https://api.day.app").strip().rstrip("/")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+# 啟用 Bark 或 Discord 時，預設自動關閉 LINE 主動推播以省下每月 200 則額度 (但 LINE 輸入 1~10 雙向回覆依然 100% 免費可用！)
+LINE_PUSH_ENABLED = os.getenv("LINE_PUSH_ENABLED", "false").lower() in ("true", "1", "yes")
 DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "SOLUSDT").strip().upper()
 
 # 黃金風控與執行參數
@@ -474,20 +480,55 @@ def build_trade_stats_report(days: int = 7) -> str:
     )
 
 def send_line_push(text: str, to_user_id: Optional[str] = None):
-    token = LINE_CHANNEL_ACCESS_TOKEN
-    uid = (to_user_id or bot_state.get("bound_user_id") or LINE_USER_ID).strip()
-    if not token or not uid:
-        return
+    """多通道免費推播：自動發送至 Bark (iOS 無上限免費推播) / Discord (繁中無上限)，並可選配 LINE Push"""
     def _push():
-        try:
-            requests.post(
-                "https://api.line.me/v2/bot/message/push",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-                json={"to": uid, "messages": [{"type": "text", "text": text[:4900]}]},
-                timeout=8
-            )
-        except Exception as e:
-            logger.error(f"LINE 推播異常: {e}")
+        msg_str = text.strip()[:4900]
+        lines = msg_str.split("\n", 1)
+        title_str = lines[0].strip() if lines else "🤖 幣安機器人通知"
+        body_str = lines[1].strip() if len(lines) > 1 else msg_str
+
+        # 1. Bark 免費無上限推播 (直接推播繁體中文至妳的 iPhone)
+        if BARK_KEY:
+            try:
+                bark_url = BARK_KEY if BARK_KEY.startswith("http") else f"{BARK_SERVER_URL}/{BARK_KEY}"
+                requests.post(
+                    bark_url.rstrip("/"),
+                    json={
+                        "title": title_str,
+                        "body": body_str,
+                        "group": "幣安機器人",
+                        "sound": "birdsong",
+                    },
+                    timeout=8
+                )
+            except Exception as e:
+                logger.error(f"Bark 推播異常: {e}")
+
+        # 2. Discord Webhook 免費無上限推播 (全繁體中文聊天室)
+        if DISCORD_WEBHOOK_URL:
+            try:
+                requests.post(
+                    DISCORD_WEBHOOK_URL,
+                    json={"content": msg_str[:1990]},
+                    timeout=8
+                )
+            except Exception as e:
+                logger.error(f"Discord 推播異常: {e}")
+
+        # 3. LINE 主動推播 (若未設定 Bark/Discord 或明確開啟 LINE_PUSH_ENABLED 才發送，避免扣每月200則額度)
+        token = LINE_CHANNEL_ACCESS_TOKEN
+        uid = (to_user_id or bot_state.get("bound_user_id") or LINE_USER_ID).strip()
+        if token and uid and (LINE_PUSH_ENABLED or (not BARK_KEY and not DISCORD_WEBHOOK_URL)):
+            try:
+                requests.post(
+                    "https://api.line.me/v2/bot/message/push",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                    json={"to": uid, "messages": [{"type": "text", "text": msg_str}]},
+                    timeout=8
+                )
+            except Exception as e:
+                logger.error(f"LINE 推播異常: {e}")
+
     threading.Thread(target=_push, daemon=True).start()
 
 def send_line_reply(reply_token: str, text: str):
@@ -1575,11 +1616,11 @@ def background_scheduler():
 async def lifespan(app: FastAPI):
     reconcile_summary = reconcile_state_with_binance(notify_if_repaired=False, strict_startup_check=True)
     threading.Thread(target=background_scheduler, daemon=True).start()
-    if LINE_CHANNEL_ACCESS_TOKEN and (LINE_USER_ID or bot_state.get("bound_user_id")):
+    if BARK_KEY or DISCORD_WEBHOOK_URL or (LINE_CHANNEL_ACCESS_TOKEN and (LINE_USER_ID or bot_state.get("bound_user_id"))):
         send_line_push(
             f"🤖 【幣安機器人 v5.4】已上線\n"
             f"{reconcile_summary}\n"
-            f"💡 快捷指令：輸入 0 查看選單"
+            f"💡 快捷指令：在 LINE 輸入 0 查看選單"
         )
     yield
 
@@ -1604,9 +1645,11 @@ def index():
     allowed, reason = is_new_entry_allowed()
     return {
         "status": "online",
-        "version": "v5.4 Anti-Wick-Washout & Zero-Overlap Sync",
+        "version": "v5.4 Anti-Wick-Washout & Zero-Overlap Sync (Bark + Discord + Free LINE Reply)",
         "new_entry_allowed": allowed,
         "gate_reason": reason,
+        "bark_enabled": bool(BARK_KEY),
+        "discord_enabled": bool(DISCORD_WEBHOOK_URL),
         "manual_paused": bot_state["manual_paused"],
         "circuit_breaker_tripped": bot_state["circuit_breaker_tripped"],
         "emergency_brake_tripped": bot_state["emergency_brake_tripped"],
@@ -2132,7 +2175,7 @@ async def handle_webhook(request: Request):
                 return {"success": True, "msg": "已平倉"}
 
             if notify_and_log_closed_position(sym, prev_cached, stage="STOP_EXIT"):
-                return {"success": True, "msg": "幣安條件止損已成交，已完成LINE通知與戰績登錄"}
+                return {"success": True, "msg": "幣安條件止損已成交，已完成通知與戰績登錄"}
 
             client.cancel_tracked_sl_only(sym)
             delete_db_position_state(sym)
