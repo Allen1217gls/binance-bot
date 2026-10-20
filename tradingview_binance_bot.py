@@ -1994,13 +1994,15 @@ async def handle_webhook(request: Request):
                 entry_order_id=db_rec["entry_order_id"] if db_rec else "",
                 trade_id=db_rec["trade_id"] if db_rec else "",
             )
-            title_str = "🎯 【1.5R TP1 止盈與保本】" if is_tp1 else "🚀 【3.0R TP2 二階止盈】"
+            is_above_be = (is_long_act and verified_sl_d >= entry_price_d) or (not is_long_act and verified_sl_d <= entry_price_d)
+            sl_label_s = "保本止損" if is_above_be else "緩衝止損"
+            title_str = ("🎯 【1.5R TP1 止盈與保本】" if is_above_be else "🎯 【1.5R TP1 減半鎖利】") if is_tp1 else "🚀 【3.0R TP2 二階止盈】"
             send_line_push(
                 f"{title_str}\n"
                 f"🪙 交易幣種：{fsym}\n"
                 f"{tp_lines}"
                 f"🏷️ 開倉價格：{client.fmt_p(sym, entry_price_d)}\n"
-                f"🛡️ 保本止損：{client.fmt_p(sym, verified_sl_d)}"
+                f"🛡️ {sl_label_s}：{client.fmt_p(sym, verified_sl_d)}"
             )
             return {"success": True, "msg": f"{'TP1' if is_tp1 else 'TP2'}完成"}
 
@@ -2053,6 +2055,13 @@ async def handle_webhook(request: Request):
                 return {"success": False, "msg": "現價未觸及止損，已保留原倉與原止損"}
 
             fmt_sl = client.fmt_p(sym, verified_sl_d)
+            if stage == "LOCK_BE":
+                send_line_push(
+                    f"🔒 【2.2R 尾倉推過成本保本】\n"
+                    f"🪙 交易幣種：{fsym}\n"
+                    f"🏷️ 開倉價格：{client.fmt_p(sym, entry_price_d)}\n"
+                    f"🛡️ 保本止損：{fmt_sl}"
+                )
             logger.info(f"🐢 {sym} 海龜移動止損已更新至 {fmt_sl} (algoId={new_aid})")
             return {"success": True, "msg": f"止損已更新至 {fmt_sl}"}
 
