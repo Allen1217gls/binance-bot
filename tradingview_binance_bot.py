@@ -1568,7 +1568,7 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=background_scheduler, daemon=True).start()
     if LINE_CHANNEL_ACCESS_TOKEN and (LINE_USER_ID or bot_state.get("bound_user_id")):
         send_line_push(
-            f"🤖 【幣安機器人 v5.2】已上線\n"
+            f"🤖 【幣安機器人 v5.3】已上線\n"
             f"{reconcile_summary}\n"
             f"💡 快捷指令：輸入 0 查看選單"
         )
@@ -1595,7 +1595,7 @@ def index():
     allowed, reason = is_new_entry_allowed()
     return {
         "status": "online",
-        "version": "v5.2 Ultimate Sync & Anti-False-Close",
+        "version": "v5.3 Anti-Wick-Washout & Sync",
         "new_entry_allowed": allowed,
         "gate_reason": reason,
         "manual_paused": bot_state["manual_paused"],
@@ -1828,7 +1828,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
         return f"🔑 你的 LINE ID：\n{user_id}"
 
     return (
-        "🤖 【幣安機器人 v5.2 選單】\n"
+        "🤖 【幣安機器人 v5.3 選單】\n"
         "🔹 「1」查詢帳戶與持倉狀態\n"
         "🔹 「2」一鍵市價全平所有倉\n"
         "🔹 「3」手動將持倉減倉 50%\n"
@@ -1905,7 +1905,7 @@ async def handle_webhook(request: Request):
             return {"success": True, "msg": sig_msg}
 
         # ==========================================================
-        # A. TP1 / TP2 減倉與保本
+        # A. TP1 / TP2 減倉與防插針緩衝保本 (與 Pine Script v5.3 100% 同步)
         # ==========================================================
         if action in ("TP1_LONG", "TP1_SHORT", "TP2_LONG", "TP2_SHORT"):
             is_tp1 = action.startswith("TP1")
@@ -1957,8 +1957,8 @@ async def handle_webhook(request: Request):
 
             be_buf = BE_BUFFER_PCT / Decimal("100")
             be_sl_d = entry_price_d * (Decimal("1") + be_buf) if is_long_act else entry_price_d * (Decimal("1") - be_buf)
-            sig_sl_d = client.quantize_price(sym, sig.stop_loss) if (sig.stop_loss and sig.stop_loss > 0) else be_sl_d
-            target_sl_d = max(be_sl_d, sig_sl_d) if is_long_act else min(be_sl_d, sig_sl_d)
+            # 直接採用 Pine Script v5.3 傳來之防插針緩衝保本價 (sig.stop_loss)，確保 TV 與幣安止損 100% 同步！
+            target_sl_d = client.quantize_price(sym, sig.stop_loss) if (sig.stop_loss and sig.stop_loss > 0) else be_sl_d
 
             cur_sl_d, _ = client.get_existing_sl_info(sym)
             if cur_sl_d and cur_sl_d > Decimal("0"):
