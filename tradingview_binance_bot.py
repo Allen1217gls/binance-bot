@@ -693,7 +693,7 @@ class BinanceClient:
                         continue
                 return dj
             except Exception:
-                # 優化第4點：若為市價下單 POST 發生網路逾時，重試前先以 origClientOrderId 查詢是否已成交，100% 防重複送單！
+                # 若為市價下單 POST 發生網路逾時，重試前先以 origClientOrderId 查詢是否已成交，100% 防重複送單！
                 if method == "POST" and endpoint == "/fapi/v1/order" and data and "newClientOrderId" in data:
                     existing = self.get_order_by_client_id(data["symbol"], data["newClientOrderId"])
                     if existing and "orderId" in existing:
@@ -1001,21 +1001,27 @@ class BinanceClient:
         qp, _ = self.get_existing_sl_info(sym)
         return float(qp) if qp is not None else None
 
-    def get_order_net_pnl(self, sym: str, order_res: Any) -> Optional[float]:
-        """向幣安 /fapi/v1/userTrades 輪詢查詢指定平倉單號之真實 realizedPnl 與手續費 (含等待撮合入庫重試)，確保與幣安『倉位歷史』100% 一致"""
+    def get_order_net_pnl(self, sym: str, order_res: Any, entry_price_ref: float = 0.0) -> Optional[float]:
+        """向幣安 /fapi/v1/userTrades 輪詢查詢指定平倉單號之真實 realizedPnl 與手續費 (支援 USDT 與 BNB 手續費折抵及非對稱進出場價換算)"""
         if not isinstance(order_res, dict) or "orderId" not in order_res:
             return None
         oid = order_res["orderId"]
         sym = sym.upper()
+        fee_r = float(_sym_fee_rate_pct(sym)) / 100.0
         for attempt in range(3):
             p = {"symbol": sym, "orderId": oid, "timestamp": int(time.time() * 1000) + self.time_offset, "recvWindow": 60000}
             p["signature"] = self._sign(p)
             res = self._safe_request("GET", "/fapi/v1/userTrades", params=p, retries=1)
             if isinstance(res, list) and len(res) > 0:
                 realized_pnl = sum(float(t.get("realizedPnl", 0.0)) for t in res)
-                close_fee = sum(float(t.get("commission", 0.0)) for t in res if t.get("commissionAsset") == "USDT")
+                total_qty = sum(float(t.get("qty", 0.0)) for t in res)
+                close_notional = sum(float(t.get("price", 0.0)) * float(t.get("qty", 0.0)) for t in res)
+                usdt_fee = sum(float(t.get("commission", 0.0)) for t in res if t.get("commissionAsset") == "USDT")
                 if abs(realized_pnl) > 0:
-                    return realized_pnl - (close_fee * 2.0)
+                    close_fee = usdt_fee if usdt_fee > 0 else (close_notional * fee_r)
+                    open_notional = (entry_price_ref * total_qty) if (entry_price_ref > 0 and total_qty > 0) else close_notional
+                    open_fee = (close_fee * (open_notional / close_notional)) if close_notional > 0 else close_fee
+                    return realized_pnl - (close_fee + open_fee)
             time.sleep(0.35 * (attempt + 1))
         return None
 
@@ -1036,10 +1042,13 @@ class BinanceClient:
         total_qty = sum(float(t.get("qty", 0.0)) for t in order_fills)
         if total_qty <= 0:
             return None
-        avg_exit = sum(float(t.get("price", 0.0)) * float(t.get("qty", 0.0)) for t in order_fills) / total_qty
+        close_notional = sum(float(t.get("price", 0.0)) * float(t.get("qty", 0.0)) for t in order_fills)
+        avg_exit = close_notional / total_qty
         realized_pnl = sum(float(t.get("realizedPnl", 0.0)) for t in order_fills)
-        fee = sum(float(t.get("commission", 0.0)) for t in order_fills if t.get("commissionAsset") == "USDT")
-        net_pnl = realized_pnl - (fee * 2.0)
+        usdt_fee = sum(float(t.get("commission", 0.0)) for t in order_fills if t.get("commissionAsset") == "USDT")
+        fee_r = float(_sym_fee_rate_pct(sym)) / 100.0
+        close_fee = usdt_fee if usdt_fee > 0 else (close_notional * fee_r)
+        net_pnl = realized_pnl - (close_fee * 2.0)
         close_side = str(order_fills[-1].get("side", "SELL")).upper()
         was_long = (close_side == "SELL")
         return {
@@ -1235,7 +1244,7 @@ def notify_and_log_closed_position(sym: str, prev_info: Optional[Dict[str, Any]]
 
 def reconcile_state_with_binance(notify_if_repaired: bool = True, strict_startup_check: bool = False) -> str:
     """
-    優化第1點：主動雙向校對機制 (防重啟錯亂)
+    主動雙向校對機制 (防重啟錯亂)
     若發現幣安有真實持倉但資料庫漏登或方向不同，自動以幣安真實持倉為準校正並補齊止損單！
     """
     try:
@@ -1343,7 +1352,7 @@ def check_emergency_hard_brake(current_eq: float) -> bool:
             notified_close_ts[sym] = time.time()
             client.cancel_tracked_sl_only(sym)
             order_res = client.order(sym, "SELL" if amt > 0 else "BUY", abs(amt), reduce_only=True, position_side=pos.get("position_side"))
-            exact_p = client.get_order_net_pnl(sym, order_res)
+            exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=pos["entry_price"])
             delete_db_position_state(sym)
             record_trade_log(sym, "EMERGENCY_BRAKE", amt, abs(amt), pos["entry_price"], pos["mark_price"], exact_pnl=exact_p)
             closed_lines.append(f"✂️ 強制清倉：{_sym_val(sym, _fmt_qty(abs(amt)) + '顆')}")
@@ -1495,7 +1504,7 @@ def background_scheduler():
                 if sym not in active_syms:
                     notify_and_log_closed_position(sym, prev_info, stage="STOP_EXIT")
 
-            # 優化第1點：每 60 秒主動雙向校對一次，若幣安有倉位但資料庫漏登或方向不同，自動補登並檢查止損！
+            # 每 60 秒主動雙向校對一次，若幣安有倉位但資料庫漏登或方向不同，自動補登並檢查止損！
             now_ts = time.time()
             if now_ts - bot_state.get("last_auto_reconcile_ts", 0.0) >= 60.0:
                 bot_state["last_auto_reconcile_ts"] = now_ts
@@ -1521,7 +1530,7 @@ def background_scheduler():
                         side = "SELL" if amt > 0 else "BUY"
                         order_res = client.order(sym, side, abs(amt), reduce_only=True, position_side=pos.get("position_side"))
                         ok_fill, exec_q, avg_p, _ = client.verify_order_fill(sym, order_res, pos["qty_dec"], is_entry=False, expected_side_dir="LONG" if amt > 0 else "SHORT")
-                        exact_p = client.get_order_net_pnl(sym, order_res)
+                        exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=pos["entry_price"])
                         client.cancel_tracked_sl_only(sym)
                         delete_db_position_state(sym)
                         exit_p = float(avg_p) if ok_fill and avg_p > Decimal("0") else pos["mark_price"]
@@ -1568,7 +1577,7 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=background_scheduler, daemon=True).start()
     if LINE_CHANNEL_ACCESS_TOKEN and (LINE_USER_ID or bot_state.get("bound_user_id")):
         send_line_push(
-            f"🤖 【幣安機器人 v5.3】已上線\n"
+            f"🤖 【幣安機器人 v5.4】已上線\n"
             f"{reconcile_summary}\n"
             f"💡 快捷指令：輸入 0 查看選單"
         )
@@ -1595,7 +1604,7 @@ def index():
     allowed, reason = is_new_entry_allowed()
     return {
         "status": "online",
-        "version": "v5.3 Anti-Wick-Washout & Sync",
+        "version": "v5.4 Anti-Wick-Washout & Zero-Overlap Sync",
         "new_entry_allowed": allowed,
         "gate_reason": reason,
         "manual_paused": bot_state["manual_paused"],
@@ -1636,7 +1645,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
             side = "SELL" if amt > 0 else "BUY"
             order_res = client.order(sym, side, abs(amt), reduce_only=True, position_side=pos.get("position_side"))
             ok_fill, exec_q, avg_p, _ = client.verify_order_fill(sym, order_res, pos["qty_dec"], is_entry=False, expected_side_dir="LONG" if amt > 0 else "SHORT")
-            exact_p = client.get_order_net_pnl(sym, order_res)
+            exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=pos["entry_price"])
             client.cancel_tracked_sl_only(sym)
             delete_db_position_state(sym)
             exit_p = float(avg_p) if ok_fill and avg_p > Decimal("0") else pos["mark_price"]
@@ -1664,7 +1673,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
                 if ok_fill and exec_q > Decimal("0"):
                     rem_after, _ = client.get_position_info_dec(sym)
                     actual_rem = abs(rem_after) if abs(rem_after) > Decimal("0") else rq_dec
-                    exact_p = client.get_order_net_pnl(sym, order_res)
+                    exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=pos["entry_price"])
                     pnl_est = record_trade_log(sym, "MANUAL_HALF", amt, float(exec_q), pos["entry_price"], float(avg_p), exact_pnl=exact_p)
                     db_s = get_db_position_state(sym)
                     if db_s:
@@ -1828,7 +1837,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
         return f"🔑 你的 LINE ID：\n{user_id}"
 
     return (
-        "🤖 【幣安機器人 v5.3 選單】\n"
+        "🤖 【幣安機器人 v5.4 選單】\n"
         "🔹 「1」查詢帳戶與持倉狀態\n"
         "🔹 「2」一鍵市價全平所有倉\n"
         "🔹 「3」手動將持倉減倉 50%\n"
@@ -1905,7 +1914,7 @@ async def handle_webhook(request: Request):
             return {"success": True, "msg": sig_msg}
 
         # ==========================================================
-        # A. TP1 / TP2 減倉與防插針緩衝保本 (與 Pine Script v5.3 100% 同步)
+        # A. TP1 / TP2 減倉與防插針緩衝保本 (與 Pine Script v5.4 100% 同步)
         # ==========================================================
         if action in ("TP1_LONG", "TP1_SHORT", "TP2_LONG", "TP2_SHORT"):
             is_tp1 = action.startswith("TP1")
@@ -1942,7 +1951,7 @@ async def handle_webhook(request: Request):
                     reduced_ok = True
                     post_amt_d, _ = client.get_position_info_dec(sym)
                     actual_rem_d = abs(post_amt_d) if abs(post_amt_d) > Decimal("0") else (abs(pos_amt_d) - exec_q)
-                    exact_p = client.get_order_net_pnl(sym, order_res)
+                    exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=float(entry_price_d))
                     net_u = record_trade_log(sym, "TP1" if is_tp1 else "TP2", float(pos_amt_d), float(exec_q), float(entry_price_d), float(avg_exit_p), exact_pnl=exact_p)
                     tp_lines = (
                         f"✂️ 減倉顆數：{_fmt_qty(exec_q)} 顆 ({int(round(float(raw_pct)))}%)\n"
@@ -1957,14 +1966,19 @@ async def handle_webhook(request: Request):
 
             be_buf = BE_BUFFER_PCT / Decimal("100")
             be_sl_d = entry_price_d * (Decimal("1") + be_buf) if is_long_act else entry_price_d * (Decimal("1") - be_buf)
-            # 直接採用 Pine Script v5.3 傳來之防插針緩衝保本價 (sig.stop_loss)，確保 TV 與幣安止損 100% 同步！
+            # 直接採用 Pine Script v5.4 傳來之防插針緩衝保本價 (sig.stop_loss)，確保 TV 與幣安止損 100% 同步！
             target_sl_d = client.quantize_price(sym, sig.stop_loss) if (sig.stop_loss and sig.stop_loss > 0) else be_sl_d
 
-            cur_sl_d, _ = client.get_existing_sl_info(sym)
+            cur_sl_d, cur_aid = client.get_existing_sl_info(sym)
             if cur_sl_d and cur_sl_d > Decimal("0"):
                 target_sl_d = max(target_sl_d, cur_sl_d) if is_long_act else min(target_sl_d, cur_sl_d)
 
-            sl_ok, new_aid, verified_sl_d = client.replace_sl_safely(sym, side, target_sl_d, position_side=pos_side)
+            # 若幣安既有止損單已等於或優於目標止損價，直接沿用原止損單，免除多餘換單延遲！
+            if cur_sl_d and cur_aid and cur_sl_d == target_sl_d:
+                sl_ok, new_aid, verified_sl_d = True, cur_aid, cur_sl_d
+            else:
+                sl_ok, new_aid, verified_sl_d = client.replace_sl_safely(sym, side, target_sl_d, position_side=pos_side)
+
             if not sl_ok:
                 curr_p_d = client.get_price_dec(sym) or curr_p_d
                 price_crossed_be = (is_long_act and curr_p_d <= target_sl_d) or (not is_long_act and curr_p_d >= target_sl_d)
@@ -1974,7 +1988,7 @@ async def handle_webhook(request: Request):
                         notified_close_ts[sym] = time.time()
                         close_res = client.order(sym, side, abs(rem_amt_d), reduce_only=True, position_side=pos_side)
                         ok_c, exec_c, avg_c, _ = client.verify_order_fill(sym, close_res, abs(rem_amt_d), is_entry=False, expected_side_dir=pos_side)
-                        exact_p = client.get_order_net_pnl(sym, close_res)
+                        exact_p = client.get_order_net_pnl(sym, close_res, entry_price_ref=float(entry_price_d))
                         client.cancel_tracked_sl_only(sym)
                         delete_db_position_state(sym)
                         record_trade_log(sym, "TP1_PROTECT", float(pos_amt_d), float(exec_c if ok_c else abs(rem_amt_d)), float(entry_price_d), float(avg_c if ok_c else curr_p_d), exact_pnl=exact_p)
@@ -2032,7 +2046,6 @@ async def handle_webhook(request: Request):
             sl_ok, new_aid, verified_sl_d = client.replace_sl_safely(sym, sl_side, new_sl_d, position_side=pos_side)
             if not sl_ok:
                 # 關鍵防呆：只有當「當前市價真的已經穿過新止損價」時，才允許執行觸價市價平倉！
-                # 若現價根本沒碰到止損價 (例如 ETH 空單現價 2383 < 止損 2410)，絕不誤平倉！
                 curr_p_d = client.get_price_dec(sym)
                 price_actually_crossed = (curr_p_d > Decimal("0")) and (
                     (is_long_pos and curr_p_d <= new_sl_d) or (not is_long_pos and curr_p_d >= new_sl_d)
@@ -2044,7 +2057,7 @@ async def handle_webhook(request: Request):
                         notified_close_ts[sym] = time.time()
                         close_res = client.order(sym, sl_side, abs(rem_amt_d), reduce_only=True, position_side=pos_side)
                         ok_c, exec_c, avg_c, _ = client.verify_order_fill(sym, close_res, abs(rem_amt_d), is_entry=False, expected_side_dir=pos_side)
-                        exact_p = client.get_order_net_pnl(sym, close_res)
+                        exact_p = client.get_order_net_pnl(sym, close_res, entry_price_ref=float(entry_price_d))
                         client.cancel_tracked_sl_only(sym)
                         delete_db_position_state(sym)
                         curr_p_d = avg_c if (ok_c and avg_c > Decimal("0")) else curr_p_d
@@ -2085,7 +2098,7 @@ async def handle_webhook(request: Request):
                 ok_fill, exec_q, avg_exit_p, _ = client.verify_order_fill(
                     sym, order_res, abs(pos_amt_d), is_entry=False, expected_side_dir=pos_side
                 )
-                exact_p = client.get_order_net_pnl(sym, order_res)
+                exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=float(entry_price_d))
                 client.cancel_tracked_sl_only(sym)
                 delete_db_position_state(sym)
 
@@ -2095,7 +2108,6 @@ async def handle_webhook(request: Request):
                 total_eq, _, _ = client.get_equity()
                 check_daily_circuit_breaker(total_eq)
 
-                # 優化第2點：若為「反手風控不足僅平舊倉 (REVERSE_SKIP_CLOSE)」，推播直覺清楚的說明！
                 if stage == "REVERSE_SKIP_CLOSE":
                     old_dir_s = "多單" if is_long_pos else "空單"
                     new_dir_s = "空單" if is_long_pos else "多單"
@@ -2246,7 +2258,6 @@ async def handle_webhook(request: Request):
                 client, sym, curr_p_d, sl_d, eq_d, est_avail_d, risk_pct_d, lev
             )
             if target_qty_d <= Decimal("0"):
-                # 優化第2點：反手或新倉風控不足時，明確告知原倉保留狀態與未開新倉原因
                 new_dir_s = "多單" if is_long_act else "空單"
                 old_dir_s = "空單" if is_long_act else "多單"
                 send_line_push(
@@ -2281,7 +2292,7 @@ async def handle_webhook(request: Request):
                     )
                     return {"success": False, "msg": "舊倉未完全歸零，中止開新倉"}
 
-                exact_p = client.get_order_net_pnl(sym, close_res)
+                exact_p = client.get_order_net_pnl(sym, close_res, entry_price_ref=float(old_entry_d))
                 client.cancel_tracked_sl_only(sym)
                 delete_db_position_state(sym)
                 rev_pnl = record_trade_log(
