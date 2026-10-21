@@ -897,8 +897,8 @@ def background_scheduler():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
  reconcile_summary = reconcile_state_with_binance(notify_if_repaired=False, strict_startup_check=True); threading.Thread(target=background_scheduler, daemon=True).start()
- if LINE_CHANNEL_ACCESS_TOKEN and (LINE_USER_ID or bot_state.get('bound_user_id')):
-  send_line_push(f'🤖 【幣安機器人 v5.4】已上線\n{reconcile_summary}\n💡 快捷指令：輸入 0 查看選單')
+ if BARK_KEY or DISCORD_WEBHOOK_URL or (LINE_CHANNEL_ACCESS_TOKEN and (LINE_USER_ID or bot_state.get('bound_user_id'))):
+  send_line_push(f'🤖 【幣安機器人 v5.5】已上線\n{reconcile_summary}\n💡 快捷指令：輸入 0 查看選單')
  yield
 app = FastAPI(lifespan=lifespan)
 class Signal(BaseModel):
@@ -908,7 +908,7 @@ class Signal(BaseModel):
 @app.get('/')
 def index():
  allowed, reason = is_new_entry_allowed()
- return {'status': 'online', 'version': 'v5.4 Anti-Wick-Washout & Zero-Overlap Sync', 'new_entry_allowed': allowed, 'gate_reason': reason, 'manual_paused': bot_state['manual_paused'], 'circuit_breaker_tripped': bot_state['circuit_breaker_tripped'], 'emergency_brake_tripped': bot_state['emergency_brake_tripped'], 'safe_mode_locked': bot_state['safe_mode_locked']}
+ return {'status': 'online', 'version': 'v5.5 Anti-Wick-Washout & Zero-Overlap Sync', 'new_entry_allowed': allowed, 'gate_reason': reason, 'manual_paused': bot_state['manual_paused'], 'circuit_breaker_tripped': bot_state['circuit_breaker_tripped'], 'emergency_brake_tripped': bot_state['emergency_brake_tripped'], 'safe_mode_locked': bot_state['safe_mode_locked']}
 @app.get('/test-binance')
 def test_binance():
  total_eq, avail, margin_ratio, raw_debug = client.get_equity_and_margin_ratio()
@@ -1070,7 +1070,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
   return f"🛡️ 名義上限：{bot_state['max_notional_mult']:.1f} 倍本金"
  if upper_text in ('ID', 'USERID', '綁定'):
   return f'🔑 你的 LINE ID：\n{user_id}'
- return f"🤖 【幣安機器人 v5.4 選單】\n🔹 「1」查詢帳戶與持倉狀態\n🔹 「2」一鍵市價全平所有倉\n🔹 「3」手動將持倉減倉 50%\n🔹 「4」手動將止損移至保本\n🔹 「6」暫停 / 「7」解除暫停\n🔹 「8」開關每小時整點推播\n🔹 「9」查看近 7 日統計週報\n🔹 「10」對齊倉位解安全鎖\n🔹 「止損 價格」智慧更新止損\n🔹 「鎖利 數字」開啟回吐鎖利\n🔹 「加碼 開/關」順勢加碼開關\n🔹 「上限 數字」保證金 {bot_state['max_margin_pct']:.0f}%\n🔹 「倍數 數字」倉位限 {bot_state['max_notional_mult']:.1f}倍\n🔹 「熔斷 數字」日回撤 -{bot_state['max_daily_dd_pct']:.0f}%\n🔹 「底線 金額」強平線 {bot_state['emergency_floor_usdt']:.0f}U"
+ return f"🤖 【幣安機器人 v5.5 選單】\n🔹 「1」查詢帳戶與持倉狀態\n🔹 「2」一鍵市價全平所有倉\n🔹 「3」手動將持倉減倉 50%\n🔹 「4」手動將止損移至保本\n🔹 「6」暫停 / 「7」解除暫停\n🔹 「8」開關每小時整點推播\n🔹 「9」查看近 7 日統計週報\n🔹 「10」對齊倉位解安全鎖\n🔹 「止損 價格」智慧更新止損\n🔹 「鎖利 數字」開啟回吐鎖利\n🔹 「加碼 開/關」順勢加碼開關\n🔹 「上限 數字」保證金 {bot_state['max_margin_pct']:.0f}%\n🔹 「倍數 數字」倉位限 {bot_state['max_notional_mult']:.1f}倍\n🔹 「熔斷 數字」日回撤 -{bot_state['max_daily_dd_pct']:.0f}%\n🔹 「底線 金額」強平線 {bot_state['emergency_floor_usdt']:.0f}U"
 @app.post('/line-webhook')
 async def line_webhook(request: Request):
  raw_body = await request.body()
@@ -1137,8 +1137,13 @@ async def handle_webhook(request: Request):
      send_line_push(f"⚠️ 【{fsym} {('TP1' if is_tp1 else 'TP2')} 減倉未完全成交】\n🚨 狀態回報：{fill_st}")
    if not reduced_ok:
     tp_lines = f'📦 保留全倉：{_fmt_qty(abs(pos_amt_d))} 顆移保本\n'
-   be_buf = BE_BUFFER_PCT / Decimal('100'); be_sl_d = entry_price_d * (Decimal('1') + be_buf) if is_long_act else entry_price_d * (Decimal('1') - be_buf)
-   target_sl_d = client.quantize_price(sym, sig.stop_loss) if sig.stop_loss and sig.stop_loss > 0 else be_sl_d; cur_sl_d, cur_aid = client.get_existing_sl_info(sym)
+   be_buf = BE_BUFFER_PCT / Decimal('100'); be_sl_d = client.quantize_price(sym, entry_price_d * (Decimal('1') + be_buf) if is_long_act else entry_price_d * (Decimal('1') - be_buf))
+   raw_sig_sl_d = client.quantize_price(sym, sig.stop_loss) if sig.stop_loss and sig.stop_loss > 0 else be_sl_d
+   if is_tp1 and not reduced_ok:
+    target_sl_d = max(raw_sig_sl_d, be_sl_d) if is_long_act else min(raw_sig_sl_d, be_sl_d)
+   else:
+    target_sl_d = raw_sig_sl_d
+   cur_sl_d, cur_aid = client.get_existing_sl_info(sym)
    if cur_sl_d and cur_sl_d > Decimal('0'):
     target_sl_d = max(target_sl_d, cur_sl_d) if is_long_act else min(target_sl_d, cur_sl_d)
    if cur_sl_d and cur_aid and (cur_sl_d == target_sl_d):
@@ -1192,9 +1197,11 @@ async def handle_webhook(request: Request):
      return {'success': True, 'msg': '現價已穿過止損，已市價出場'}
     logger.warning(f'⚠️ {sym} UPDATE_SL ({new_sl_d}) 暫未更新成功，但現價 ({curr_p_d}) 未觸及止損，保留原倉與原止損！')
     return {'success': False, 'msg': '現價未觸及止損，已保留原倉與原止損'}
-   fmt_sl = client.fmt_p(sym, verified_sl_d)
+   fmt_sl = client.fmt_p(sym, verified_sl_d); old_sl_s = client.fmt_p(sym, cur_sl_d) if cur_sl_d and cur_sl_d > Decimal('0') else '初始止損'; dir_s = '多單' if is_long_pos else '空單'
    if stage == 'LOCK_BE':
-    send_line_push(f'🔒 【2.2R 尾倉推過成本保本】\n🪙 交易幣種：{fsym}\n🏷️ 開倉價格：{client.fmt_p(sym, entry_price_d)}\n🛡️ 保本止損：{fmt_sl}')
+    send_line_push(f'🔒 【2.2R 尾倉推過成本保本】\n🪙 交易幣種：{fsym} ({dir_s})\n🏷️ 開倉價格：{client.fmt_p(sym, entry_price_d)}\n🛡️ 原止損價：{old_sl_s}\n🛡️ 新保本價：{fmt_sl}')
+   else:
+    send_line_push(f'🐢 【海龜移動止損更新】\n🪙 交易幣種：{fsym} ({dir_s})\n🏷️ 開倉價格：{client.fmt_p(sym, entry_price_d)}\n🛡️ 原止損價：{old_sl_s}\n🛡️ 新止損價：{fmt_sl}')
    logger.info(f'🐢 {sym} 海龜移動止損已更新至 {fmt_sl} (algoId={new_aid})')
    return {'success': True, 'msg': f'止損已更新至 {fmt_sl}'}
   if action in ('CLOSE_LONG', 'CLOSE_SHORT'):
@@ -1245,11 +1252,13 @@ async def handle_webhook(request: Request):
    ok_fill, exec_q, _, _ = client.verify_order_fill(sym, order_res, add_qty_d, is_entry=True, expected_side_dir=pos_side)
    if not ok_fill or exec_q <= Decimal('0'):
     return {'success': False, 'msg': '加碼下單未成交'}
-   new_amt_d, new_entry_d = client.get_position_info_dec(sym); cur_sl_d, _ = client.get_existing_sl_info(sym); be_buf = BE_BUFFER_PCT / Decimal('100')
+   new_amt_d, new_entry_d = client.get_position_info_dec(sym); cur_sl_d, cur_aid = client.get_existing_sl_info(sym); be_buf = BE_BUFFER_PCT / Decimal('100')
    be_new_d = new_entry_d * (Decimal('1') + be_buf) if is_long else new_entry_d * (Decimal('1') - be_buf); base_sl_d = cur_sl_d if cur_sl_d and cur_sl_d > Decimal('0') else sl_d
    safe_sl_d = max(base_sl_d, sl_d, be_new_d) if is_long else min(base_sl_d, sl_d, be_new_d)
    sl_ok, new_aid, verified_sl_d = client.replace_sl_safely(sym, sl_side, safe_sl_d, position_side=pos_side)
-   send_line_push(f'🚀 【順勢金字塔加碼成功】\n🪙 交易幣種：{fsym} ({lev}x)\n➕ 加碼顆數：{_fmt_qty(exec_q)} 顆\n🪙 總持倉量：{_fmt_qty(abs(new_amt_d))} 顆\n🏷️ 最新均價：{client.fmt_p(sym, new_entry_d)}\n🛡️ 保護止損：{client.fmt_p(sym, verified_sl_d if sl_ok else safe_sl_d)}')
+   db_rec = get_db_position_state(sym); final_sl_d = verified_sl_d if sl_ok else safe_sl_d
+   upsert_db_position_state(sym=sym, side=pos_side, qty=abs(new_amt_d), entry_price=new_entry_d, init_sl=db_rec['init_sl_dec'] if db_rec else final_sl_d, current_sl=final_sl_d, sl_algo_id=new_aid or cur_aid or (db_rec['sl_algo_id'] if db_rec else ''), stage='PYRAMID_ADDED', entry_order_id=db_rec['entry_order_id'] if db_rec else '', trade_id=db_rec['trade_id'] if db_rec else '')
+   send_line_push(f'🚀 【順勢金字塔加碼成功】\n🪙 交易幣種：{fsym} ({lev}x)\n➕ 加碼顆數：{_fmt_qty(exec_q)} 顆\n🪙 總持倉量：{_fmt_qty(abs(new_amt_d))} 顆\n🏷️ 最新均價：{client.fmt_p(sym, new_entry_d)}\n🛡️ 保護止損：{client.fmt_p(sym, final_sl_d)}')
    return {'success': True, 'added_qty': float(exec_q)}
   if action in ('LONG', 'SHORT'):
    is_long_act = action == 'LONG'; pos_side = 'LONG' if is_long_act else 'SHORT'; pos_amt_d, old_entry_d = client.get_position_info_dec(sym); curr_p_d = client.get_price_dec(sym)
