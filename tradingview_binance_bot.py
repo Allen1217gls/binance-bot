@@ -26,8 +26,8 @@ BARK_SERVER_URL = os.getenv('BARK_SERVER_URL', 'https://api.day.app').strip().rs
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', '').strip()
 LINE_PUSH_ENABLED = os.getenv('LINE_PUSH_ENABLED', 'false').lower() in ('true', '1', 'yes')
 DEFAULT_SYMBOL = os.getenv('DEFAULT_SYMBOL', 'SOLUSDT').strip().upper()
-DAILY_MAX_DD_PCT = Decimal(os.getenv('DAILY_MAX_DD_PCT', '40.0'))
-EMERGENCY_FLOOR_USDT = Decimal(os.getenv('EMERGENCY_FLOOR_USDT', '30.0'))
+DAILY_MAX_DD_PCT = Decimal(os.getenv('DAILY_MAX_DD_PCT', '20.0'))
+EMERGENCY_FLOOR_USDT = Decimal(os.getenv('EMERGENCY_FLOOR_USDT', '150.0'))
 MARGIN_ALERT_RATIO = Decimal(os.getenv('MARGIN_ALERT_RATIO', '60.0'))
 MAX_ENTRY_SLIPPAGE_PCT = Decimal(os.getenv('MAX_ENTRY_SLIPPAGE_PCT', '1.5'))
 MAX_MARGIN_PCT_PER_TRADE = Decimal(os.getenv('MAX_MARGIN_PCT_PER_TRADE', '20.0'))
@@ -44,9 +44,6 @@ SIGNAL_DEDUP_SEC = float(os.getenv('SIGNAL_DEDUP_SEC', '300.0'))
 EMERGENCY_SL_FALLBACK_PCT = Decimal(os.getenv('EMERGENCY_SL_FALLBACK_PCT', '2.5'))
 STRICT_ONE_WAY_ONLY = os.getenv('STRICT_ONE_WAY_ONLY', 'false').lower() in ('true', '1', 'yes')
 ALLOW_PYRAMIDING = os.getenv('ALLOW_PYRAMIDING', 'false').lower() in ('true', '1', 'yes')
-TRAIL_PROFIT_ENABLED = os.getenv('TRAIL_PROFIT_ENABLED', 'false').lower() in ('true', '1', 'yes')
-TRAIL_PROFIT_TRIGGER_U = Decimal(os.getenv('TRAIL_PROFIT_TRIGGER_U', '5.0'))
-TRAIL_PROFIT_GIVEBACK_PCT = Decimal(os.getenv('TRAIL_PROFIT_GIVEBACK_PCT', '20.0'))
 SMART_MAKER_ENABLED = os.getenv('SMART_MAKER_ENABLED', 'true').lower() in ('true', '1', 'yes')
 CORR_GUARD_ENABLED = os.getenv('CORR_GUARD_ENABLED', 'true').lower() in ('true', '1', 'yes')
 FUNDING_GUARD_ENABLED = os.getenv('FUNDING_GUARD_ENABLED', 'true').lower() in ('true', '1', 'yes')
@@ -56,8 +53,8 @@ TW_TZ = timezone(timedelta(hours=8))
 state_lock = threading.RLock()
 VALID_ACTIONS = {'LONG', 'SHORT', 'ADD_LONG', 'ADD_SHORT', 'TP1_LONG', 'TP1_SHORT', 'TP2_LONG', 'TP2_SHORT', 'UPDATE_SL', 'CLOSE_LONG', 'CLOSE_SHORT'}
 TRADFI_SYMBOLS = {'SNDKUSDT', 'TSLAUSDT', 'NVDAUSDT', 'AAPLUSDT', 'COINUSDT'}
-BOOL_FLAG_KEYS = ('manual_paused', 'circuit_breaker_tripped', 'emergency_brake_tripped', 'safe_mode_locked', 'allow_pyramiding', 'trail_profit_enabled', 'hourly_push_enabled', 'smart_maker_enabled', 'corr_guard_enabled', 'funding_guard_enabled')
-FLOAT_FLAG_KEYS = ('max_daily_dd_pct', 'emergency_floor_usdt', 'max_entry_slippage_pct', 'max_margin_pct', 'max_notional_mult', 'trail_profit_trigger_u', 'trail_profit_giveback_pct')
+BOOL_FLAG_KEYS = ('manual_paused', 'circuit_breaker_tripped', 'emergency_brake_tripped', 'safe_mode_locked', 'allow_pyramiding', 'hourly_push_enabled', 'smart_maker_enabled', 'corr_guard_enabled', 'funding_guard_enabled')
+FLOAT_FLAG_KEYS = ('max_daily_dd_pct', 'emergency_floor_usdt', 'max_entry_slippage_pct', 'max_margin_pct', 'max_notional_mult')
 STR_FLAG_KEYS = ('safe_mode_reason', 'bound_user_id', 'last_symbol')
 
 bot_state: Dict[str, Any] = {
@@ -66,18 +63,16 @@ bot_state: Dict[str, Any] = {
     'max_daily_dd_pct': float(DAILY_MAX_DD_PCT), 'emergency_floor_usdt': float(EMERGENCY_FLOOR_USDT),
     'max_entry_slippage_pct': float(MAX_ENTRY_SLIPPAGE_PCT), 'max_margin_pct': float(MAX_MARGIN_PCT_PER_TRADE),
     'max_notional_mult': float(MAX_NOTIONAL_MULT), 'allow_pyramiding': ALLOW_PYRAMIDING,
-    'trail_profit_enabled': TRAIL_PROFIT_ENABLED, 'trail_profit_trigger_u': float(TRAIL_PROFIT_TRIGGER_U),
-    'trail_profit_giveback_pct': float(TRAIL_PROFIT_GIVEBACK_PCT), 'hourly_push_enabled': False,
-    'smart_maker_enabled': SMART_MAKER_ENABLED, 'corr_guard_enabled': CORR_GUARD_ENABLED,
-    'funding_guard_enabled': FUNDING_GUARD_ENABLED, 'bound_user_id': LINE_USER_ID,
-    'last_symbol': DEFAULT_SYMBOL, 'last_margin_alert_ts': 0.0, 'last_auto_reconcile_ts': 0.0,
+    'hourly_push_enabled': False, 'smart_maker_enabled': SMART_MAKER_ENABLED,
+    'corr_guard_enabled': CORR_GUARD_ENABLED, 'funding_guard_enabled': FUNDING_GUARD_ENABLED,
+    'bound_user_id': LINE_USER_ID, 'last_symbol': DEFAULT_SYMBOL,
+    'last_margin_alert_ts': 0.0, 'last_auto_reconcile_ts': 0.0,
     'consecutive_api_failures': 0, 'api_disconnected_alerted': False
 }
 recent_signals_cache: Dict[str, float] = {}
 last_entry_ts: Dict[str, float] = {}
 notified_close_ts: Dict[str, float] = {}
 known_positions: Dict[str, Dict[str, Any]] = {}
-peak_upnl_tracker: Dict[str, float] = {}
 trade_logs_mem: List[Tuple[str, str, str, float]] = []
 
 def _to_dec(val: Any, default: str='0') -> Decimal:
@@ -285,7 +280,6 @@ def get_all_db_positions() -> Dict[str, Dict[str, Any]]:
 def delete_db_position_state(sym: str):
     sym = sym.upper()
     known_positions.pop(sym, None)
-    peak_upnl_tracker.pop(sym, None)
     try:
         with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
             conn.execute('PRAGMA journal_mode=WAL;')
@@ -1026,7 +1020,6 @@ class BinanceClient:
 def compute_institutional_risk_multiplier(c: BinanceClient, sym: str, is_long: bool, base_risk_pct: Decimal, equity_u: float) -> Tuple[Decimal, List[str]]:
     mult = Decimal('1.0')
     notes: List[str] = []
-    # 模組 ②：幣安原生合約資金費率過熱防護 (Funding Rate Crowd Filter)
     if bot_state.get('funding_guard_enabled', True):
         fr_pct = c.get_funding_rate_pct(sym)
         if (is_long and fr_pct >= 0.08) or (not is_long and fr_pct <= -0.08):
@@ -1034,7 +1027,6 @@ def compute_institutional_risk_multiplier(c: BinanceClient, sym: str, is_long: b
             notes.append(f'費率過熱({fr_pct:+.3f}%)降險0.6x')
         elif (is_long and fr_pct <= -0.05) or (not is_long and fr_pct >= 0.05):
             notes.append(f'逆向費率順風({fr_pct:+.3f}%)')
-    # 模組 ③-A：跨幣種同方向未保本風險保護 (Portfolio Correlation Heat Guard)
     if bot_state.get('corr_guard_enabled', True):
         db_map = get_all_db_positions()
         target_side = 'LONG' if is_long else 'SHORT'
@@ -1051,7 +1043,6 @@ def compute_institutional_risk_multiplier(c: BinanceClient, sym: str, is_long: b
         if unhedged_peers:
             mult *= Decimal('0.65')
             notes.append(f"同向未保本({','.join(unhedged_peers)})聯動降險0.65x")
-    # 模組 ③-B：當日回撤自適應縮倉保護 (Drawdown Adaptive Risk Scaling)
     if equity_u > 0:
         td_pnl = get_today_realized_pnl_u()
         if td_pnl < 0 and abs(td_pnl) / equity_u * 100.0 >= 3.5:
@@ -1258,7 +1249,7 @@ def build_status_report(title: str='📊 【即時帳戶與持倉查詢】') -> 
         pct_s = f'{pct:+.0f}%' if abs(pct) >= 10.0 else f'{pct:+.1f}%'
         daily_pnl_str = f'{_fmt_u(diff, signed=True)} ({pct_s})'
     else:
-        daily_pnl_str = '+0.00U (0.0%)'
+        daily_pnl_str = '+0.00U (+0.0%)'
     inst_tags = []
     if bot_state.get('smart_maker_enabled', True):
         inst_tags.append('BBO限價優先')
@@ -1266,8 +1257,6 @@ def build_status_report(title: str='📊 【即時帳戶與持倉查詢】') -> 
         inst_tags.append('同向風控')
     if bot_state.get('funding_guard_enabled', True):
         inst_tags.append('費率濾網')
-    if bot_state.get('trail_profit_enabled', False):
-        inst_tags.append(f"鎖利{bot_state['trail_profit_trigger_u']:.0f}U")
     if bot_state.get('allow_pyramiding', False):
         inst_tags.append('加碼')
     inst_str = '/'.join(inst_tags) if inst_tags else '基礎市價模式'
@@ -1347,26 +1336,6 @@ def background_scheduler():
                             if not db_rec or db_rec.get('side') != side_str:
                                 reconcile_state_with_binance(notify_if_repaired=True)
                                 break
-                    if bot_state['trail_profit_enabled']:
-                        trig_u = bot_state['trail_profit_trigger_u']
-                        gb_pct = bot_state['trail_profit_giveback_pct']
-                        for pos in active_positions:
-                            sym, amt, upnl = (pos['symbol'], pos['amt'], pos['upnl'])
-                            prev_peak = peak_upnl_tracker.get(sym, 0.0)
-                            if upnl > prev_peak:
-                                peak_upnl_tracker[sym] = upnl
-                                prev_peak = upnl
-                            if prev_peak >= trig_u and upnl <= prev_peak * (1.0 - gb_pct / 100.0):
-                                notified_close_ts[sym] = time.time()
-                                side = 'SELL' if amt > 0 else 'BUY'
-                                order_res = client.order(sym, side, abs(amt), reduce_only=True, position_side=pos.get('position_side'))
-                                ok_fill, exec_q, avg_p, _ = client.verify_order_fill(sym, order_res, pos['qty_dec'], is_entry=False, expected_side_dir='LONG' if amt > 0 else 'SHORT')
-                                exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=pos['entry_price'])
-                                client.cancel_tracked_sl_only(sym)
-                                delete_db_position_state(sym)
-                                exit_p = float(avg_p) if ok_fill and avg_p > Decimal('0') else pos['mark_price']
-                                net_u = record_trade_log(sym, 'TRAIL_PROFIT', amt, float(exec_q) if ok_fill else abs(amt), pos['entry_price'], exit_p, exact_pnl=exact_p)
-                                send_line_push(f'💰 【追蹤止盈回吐鎖利全平】\n🪙 交易幣種：{_full_sym(sym)}\n🚀 最高浮盈：{_fmt_u(prev_peak, signed=True)}\n💵 鎖定落袋：{_fmt_u(net_u, signed=True)}\n🛡️ 觸發條件：高點回吐 {gb_pct:.0f}%')
                 now_ts = time.time()
                 if margin_ratio >= float(MARGIN_ALERT_RATIO) and now_ts - bot_state['last_margin_alert_ts'] > 1800:
                     bot_state['last_margin_alert_ts'] = now_ts
@@ -1523,6 +1492,16 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
                     else:
                         res.append(f'❌ 掛單失敗：{_disp_sym(sym)} (保留原止損)')
             return '🛡️ 【手動移至保本結果】\n' + '\n'.join(res)
+        if text in ('5', '止損', '改止損', 'SL'):
+            positions = client.get_all_active_positions()
+            if not positions:
+                return '📭 目前無持倉可改止損\n💡 有持倉時請輸入「5 價格」（例如：5 105.5）更新止損'
+            sl_lines = []
+            for p in positions:
+                s = p['symbol']
+                cur_sl = client._current_sl.get(s) or client.get_existing_sl_price(s)
+                sl_lines.append(f"🔸 {_disp_sym(s)}：開倉 {client.fmt_p(s, p['entry_price_dec'])} / 止損 {client.fmt_p(s, cur_sl) if cur_sl else '依條件單'}")
+            return '🛡️ 【目前持倉止損一覽】\n' + '\n'.join(sl_lines) + '\n💡 修改請輸入：「5 價格」（如：5 105.5）'
         m_sl = re.match('^(?:5|止損|改止損|SL)\\s+(?:([A-Z0-9]+)\\s+)?([0-9.]+)$', upper_text)
         if m_sl:
             sym_arg, new_sl = (m_sl.group(1), _to_dec(m_sl.group(2)))
@@ -1606,23 +1585,6 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
             bot_state['funding_guard_enabled'] = False
             save_system_flags()
             return '📊 資金費率過熱濾網：⏸️ 已關閉'
-        if upper_text in ('鎖利', '鎖利 開', '追蹤止盈'):
-            bot_state['trail_profit_enabled'] = not bot_state['trail_profit_enabled']
-            save_system_flags()
-            st = f"🟢 滿{bot_state['trail_profit_trigger_u']:.0f}U回吐{bot_state['trail_profit_giveback_pct']:.0f}%" if bot_state['trail_profit_enabled'] else '⏸️ 已關閉'
-            return f'💰 追蹤鎖利：{st}'
-        if upper_text in ('鎖利 關', '鎖利 OFF'):
-            bot_state['trail_profit_enabled'] = False
-            save_system_flags()
-            return '💰 追蹤鎖利：⏸️ 已關閉'
-        m_tp_lock = re.match('^(?:鎖利|TRAIL)\\s+([0-9.]+)(?:\\s+([0-9.]+))?$', upper_text)
-        if m_tp_lock:
-            bot_state['trail_profit_enabled'] = True
-            bot_state['trail_profit_trigger_u'] = max(0.5, float(m_tp_lock.group(1)))
-            if m_tp_lock.group(2):
-                bot_state['trail_profit_giveback_pct'] = max(5.0, min(60.0, float(m_tp_lock.group(2))))
-            save_system_flags()
-            return f"💰 追蹤鎖利：滿{bot_state['trail_profit_trigger_u']:.1f}U回吐{bot_state['trail_profit_giveback_pct']:.0f}%"
         if upper_text in ('加碼', '加碼 開', '加碼 ON'):
             bot_state['allow_pyramiding'] = True
             save_system_flags()
@@ -1664,6 +1626,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
             f"🔹 「2」一鍵市價全平所有倉\n"
             f"🔹 「3」手動將持倉減倉 50%\n"
             f"🔹 「4」手動將止損移至保本\n"
+            f"🔹 「5」智慧手動更新止損價\n"
             f"🔹 「6」暫停 / 「7」解除暫停\n"
             f"🔹 「8」開關每小時整點推播\n"
             f"🔹 「9」查看近 7 日統計週報\n"
@@ -1671,9 +1634,11 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
             f"🔹 「限價 開/關」BBO限價優先\n"
             f"🔹 「同向 開/關」跨幣同向降險\n"
             f"🔹 「費率 開/關」費率過熱濾網\n"
-            f"🔹 「止損 價格」智慧更新止損\n"
-            f"🔹 「鎖利 數字」開啟回吐鎖利\n"
-            f"🔹 「加碼 開/關」順勢加碼開關"
+            f"🔹 「加碼 開/關」順勢加碼開關\n"
+            f"🔹 「上限 數字」保證金 {bot_state['max_margin_pct']:.0f}%\n"
+            f"🔹 「倍數 數字」倉位限 {bot_state['max_notional_mult']:.1f}倍\n"
+            f"🔹 「熔斷 數字」日回撤 -{bot_state['max_daily_dd_pct']:.0f}%\n"
+            f"🔹 「底線 金額」強平線 {bot_state['emergency_floor_usdt']:.0f}U"
         )
 
 @app.post('/line-webhook')
@@ -1941,7 +1906,6 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
             _, eff_lev = client.verify_and_set_leverage(sym, target_lev)
             eff_lev = eff_lev or target_lev
             base_risk_d = _to_dec(sig.risk_pct, '1.5')
-            # 呼叫機構級模組 ② & ③ 動態計算風險係數
             eff_risk_d, inst_notes = compute_institutional_risk_multiplier(client, sym, is_long, base_risk_d, total_eq)
             qty_d, q_reason = calculate_order_qty_decimal(client, sym, curr_p_d, sl_d, _to_dec(total_eq), _to_dec(avail), eff_risk_d, eff_lev)
             if qty_d <= Decimal('0'):
@@ -1951,7 +1915,6 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
             entry_side = 'BUY' if is_long else 'SELL'
             pos_side = 'LONG' if is_long else 'SHORT'
             sl_side = 'SELL' if is_long else 'BUY'
-            # 呼叫機構級模組 ⑤：BBO 智慧限價優先 + 市價無縫兜底
             order_res, exec_mode = client.smart_order(sym, entry_side, qty_d, reduce_only=False, position_side=pos_side, allow_maker=True)
             ok_fill, fill_qty_d, fill_price_d, fill_st = client.verify_order_fill(sym, order_res, qty_d, is_entry=True, expected_side_dir=pos_side)
             if not ok_fill or fill_qty_d <= Decimal('0'):
@@ -1973,7 +1936,6 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
             oid_str = str(order_res.get('orderId', '')) if isinstance(order_res, dict) else ''
             upsert_db_position_state(sym=sym, side=pos_side, qty=fill_qty_d, entry_price=fill_price_d, init_sl=verified_sl_d, current_sl=verified_sl_d, sl_algo_id=sl_aid, stage='INIT', entry_order_id=oid_str)
             last_entry_ts[sym] = time.time()
-            peak_upnl_tracker[sym] = 0.0
             notional_u = float(fill_qty_d * fill_price_d)
             margin_u = notional_u / max(eff_lev, 1)
             stop_dist_d = abs(fill_price_d - verified_sl_d)
