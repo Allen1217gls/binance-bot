@@ -679,6 +679,12 @@ class BinanceClient:
         res = self._safe_request('DELETE', '/fapi/v1/order', params=p, retries=2)
         return isinstance(res, dict) and ('orderId' in res or res.get('code') == -2011)
 
+    def cancel_all_standard_open_orders(self, sym: str):
+        sym = sym.upper()
+        p = {'symbol': sym, 'timestamp': int(time.time() * 1000) + self.time_offset, 'recvWindow': 60000}
+        p['signature'] = self._sign(p)
+        self._safe_request('DELETE', '/fapi/v1/allOpenOrders', params=p, retries=1)
+
     def order(self, sym: str, side: str, qty: Any, reduce_only: bool=False, position_side: Optional[str]=None) -> Any:
         sym = sym.upper()
         dq = self.quantize_qty(sym, qty, round_up=False)
@@ -686,7 +692,11 @@ class BinanceClient:
             return None
         q_str = self.fmt_q_api(sym, dq)
         client_oid = f'HTB_{sym[:6]}_{int(time.time() * 1000)}_{secrets.token_hex(2)}'
-        p: Dict[str, Any] = {'symbol': sym, 'side': side.upper(), 'type': 'MARKET', 'quantity': q_str, 'newClientOrderId': client_oid, 'timestamp': int(time.time() * 1000) + self.time_offset, 'recvWindow': 60000}
+        p: Dict[str, Any] = {
+            'symbol': sym, 'side': side.upper(), 'type': 'MARKET', 'quantity': q_str,
+            'newClientOrderId': client_oid, 'newOrderRespType': 'RESULT',
+            'timestamp': int(time.time() * 1000) + self.time_offset, 'recvWindow': 60000
+        }
         if bot_state.get('hedge_mode'):
             if position_side:
                 p['positionSide'] = position_side.upper()
@@ -704,7 +714,8 @@ class BinanceClient:
         dq = self.quantize_qty(sym, qty, round_up=False)
         if dq <= Decimal('0'):
             return (None, 'NONE')
-        if not allow_maker or not bot_state.get('smart_maker_enabled', False):
+        # 部分減倉 (reduce_only=True) 強制走單筆原子市價單，徹底杜絕「限價50% + 市價50% = 誤平100%」的競態風險
+        if reduce_only or not allow_maker or not bot_state.get('smart_maker_enabled', False):
             return (self.order(sym, side, dq, reduce_only=reduce_only, position_side=position_side), 'MARKET')
         bid, ask = self.get_bbo_prices(sym)
         target_p = bid if side.upper() == 'BUY' else ask
@@ -715,7 +726,7 @@ class BinanceClient:
         client_oid = f'HTM_{sym[:6]}_{int(time.time() * 1000)}_{secrets.token_hex(2)}'
         p: Dict[str, Any] = {
             'symbol': sym, 'side': side.upper(), 'type': 'LIMIT', 'timeInForce': 'GTX',
-            'price': p_str, 'quantity': q_str, 'newClientOrderId': client_oid,
+            'price': p_str, 'quantity': q_str, 'newClientOrderId': client_oid, 'newOrderRespType': 'RESULT',
             'timestamp': int(time.time() * 1000) + self.time_offset, 'recvWindow': 60000
         }
         if bot_state.get('hedge_mode'):
@@ -727,6 +738,16 @@ class BinanceClient:
         if not isinstance(res, dict) or 'orderId' not in res:
             return (self.order(sym, side, dq, reduce_only=reduce_only, position_side=position_side), 'MARKET')
         oid = res['orderId']
+        init_st = str(res.get('status', '')).upper()
+        init_exec = self.quantize_qty(sym, _to_dec(res.get('executedQty', '0')))
+        if init_st == 'FILLED' or init_exec >= dq:
+            return (res, 'MAKER_GTX')
+        if init_st in ('CANCELED', 'EXPIRED', 'REJECTED'):
+            rem_q = self.quantize_qty(sym, dq - init_exec)
+            if rem_q > Decimal('0'):
+                m_res = self.order(sym, side, rem_q, reduce_only=reduce_only, position_side=position_side)
+                return (m_res or res, 'MARKET')
+            return (res, 'MAKER_GTX')
         for _ in range(3):
             time.sleep(0.45)
             info = self.get_order_status(sym, oid)
@@ -745,9 +766,22 @@ class BinanceClient:
                         m_res['_hybrid_limit_price'] = str(target_p)
                     return (m_res or info, 'HYBRID' if exec_q > Decimal('0') else 'MARKET')
                 return (info, 'MAKER_GTX')
-        self.cancel_standard_order(sym, oid)
-        info = self.get_order_status(sym, oid) or res
+        # 嚴格確認撤單成功或已完全成交後，才允許補發剩餘市價單，防止雙重成交
+        for _ in range(3):
+            self.cancel_standard_order(sym, oid)
+            info = self.get_order_status(sym, oid)
+            if info:
+                st = str(info.get('status', '')).upper()
+                if st in ('FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'):
+                    break
+            time.sleep(0.25)
+        info = info or self.get_order_status(sym, oid) or res
+        st_final = str(info.get('status', '')).upper()
         exec_q = self.quantize_qty(sym, _to_dec(info.get('executedQty', '0')))
+        if st_final == 'FILLED' or exec_q >= dq:
+            return (info, 'MAKER_GTX')
+        if st_final not in ('CANCELED', 'EXPIRED', 'REJECTED'):
+            return (info, 'MAKER_GTX')
         rem_q = self.quantize_qty(sym, dq - exec_q)
         if rem_q > Decimal('0'):
             m_res = self.order(sym, side, rem_q, reduce_only=reduce_only, position_side=position_side)
@@ -765,7 +799,7 @@ class BinanceClient:
         res = self._safe_request('GET', '/fapi/v1/order', params=p, retries=2)
         return res if isinstance(res, dict) and 'orderId' in res else None
 
-    def verify_order_fill(self, sym: str, order_res: Any, expected_qty: Decimal, is_entry: bool=False, expected_side_dir: str='LONG') -> Tuple[bool, Decimal, Decimal, str]:
+    def verify_order_fill(self, sym: str, order_res: Any, expected_qty: Decimal, is_entry: bool=False, expected_side_dir: str='LONG', pre_pos_qty: Optional[Decimal]=None) -> Tuple[bool, Decimal, Decimal, str]:
         sym = sym.upper()
         if not isinstance(order_res, dict) or 'orderId' not in order_res:
             return (False, Decimal('0'), Decimal('0'), str(order_res))
@@ -792,9 +826,14 @@ class BinanceClient:
                 total_exec_qty = abs(pos_amt)
                 avg_p = pos_ep if pos_ep > Decimal('0') else self.get_price_dec(sym)
                 status = 'FILLED'
-            elif not is_entry and status == 'FILLED':
-                total_exec_qty = expected_qty
-                avg_p = avg_p if avg_p > Decimal('0') else self.get_price_dec(sym)
+            elif not is_entry:
+                if status == 'FILLED':
+                    total_exec_qty = expected_qty
+                    avg_p = avg_p if avg_p > Decimal('0') else self.get_price_dec(sym)
+                elif pre_pos_qty is not None and pre_pos_qty > abs(pos_amt):
+                    total_exec_qty = self.quantize_qty(sym, pre_pos_qty - abs(pos_amt))
+                    avg_p = avg_p if avg_p > Decimal('0') else self.get_price_dec(sym)
+                    status = 'FILLED'
         if avg_p <= Decimal('0'):
             avg_p = pos_ep if pos_ep > Decimal('0') else self.get_price_dec(sym)
         is_ok = status in ('FILLED', 'PARTIALLY_FILLED') and total_exec_qty > Decimal('0')
@@ -815,6 +854,7 @@ class BinanceClient:
 
     def cancel_tracked_sl_only(self, sym: str):
         sym = sym.upper()
+        self.cancel_all_standard_open_orders(sym)
         tracked_id = self._tracked_algo_ids.get(sym)
         db_state = get_db_position_state(sym)
         if db_state and db_state.get('sl_algo_id'):
@@ -1450,7 +1490,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
                 notified_close_ts[sym] = time.time()
                 side = 'SELL' if amt > 0 else 'BUY'
                 order_res = client.order(sym, side, abs(amt), reduce_only=True, position_side=pos.get('position_side'))
-                ok_fill, exec_q, avg_p, _ = client.verify_order_fill(sym, order_res, pos['qty_dec'], is_entry=False, expected_side_dir='LONG' if amt > 0 else 'SHORT')
+                ok_fill, exec_q, avg_p, _ = client.verify_order_fill(sym, order_res, pos['qty_dec'], is_entry=False, expected_side_dir='LONG' if amt > 0 else 'SHORT', pre_pos_qty=pos['qty_dec'])
                 exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=pos['entry_price'])
                 client.cancel_tracked_sl_only(sym)
                 delete_db_position_state(sym)
@@ -1473,8 +1513,8 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
                 if hq_dec <= Decimal('0') or rq_dec <= Decimal('0'):
                     res.append(f'⚠️ 無法拆半：{_disp_sym(sym)} (已達最小1顆)')
                 else:
-                    order_res, _ = client.smart_order(sym, 'SELL' if amt > 0 else 'BUY', hq_dec, reduce_only=True, position_side=pos.get('position_side'))
-                    ok_fill, exec_q, avg_p, _ = client.verify_order_fill(sym, order_res, hq_dec, is_entry=False, expected_side_dir='LONG' if amt > 0 else 'SHORT')
+                    order_res, _ = client.smart_order(sym, 'SELL' if amt > 0 else 'BUY', hq_dec, reduce_only=True, position_side=pos.get('position_side'), allow_maker=False)
+                    ok_fill, exec_q, avg_p, _ = client.verify_order_fill(sym, order_res, hq_dec, is_entry=False, expected_side_dir='LONG' if amt > 0 else 'SHORT', pre_pos_qty=pos['qty_dec'])
                     if ok_fill and exec_q > Decimal('0'):
                         rem_after, _ = client.get_position_info_dec(sym)
                         actual_rem = abs(rem_after) if abs(rem_after) > Decimal('0') else rq_dec
@@ -1711,9 +1751,9 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
             actual_rem_d = abs(pos_amt_d)
             exec_mode_tag = ''
             if Decimal('0') < close_qty_d < abs(pos_amt_d) and rem_qty_d > Decimal('0'):
-                order_res, exec_mode = client.smart_order(sym, side, close_qty_d, reduce_only=True, position_side=pos_side, allow_maker=True)
+                order_res, exec_mode = client.smart_order(sym, side, close_qty_d, reduce_only=True, position_side=pos_side, allow_maker=False)
                 exec_mode_tag = ' (Maker限價)' if exec_mode == 'MAKER_GTX' else (' (混合成交)' if exec_mode == 'HYBRID' else '')
-                ok_fill, exec_q, avg_exit_p, fill_st = client.verify_order_fill(sym, order_res, close_qty_d, is_entry=False, expected_side_dir=pos_side)
+                ok_fill, exec_q, avg_exit_p, fill_st = client.verify_order_fill(sym, order_res, close_qty_d, is_entry=False, expected_side_dir=pos_side, pre_pos_qty=abs(pos_amt_d))
                 if ok_fill and exec_q > Decimal('0'):
                     reduced_ok = True
                     post_amt_d, _ = client.get_position_info_dec(sym)
@@ -1750,7 +1790,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
                     if abs(rem_amt_d) > Decimal('0'):
                         notified_close_ts[sym] = time.time()
                         close_res = client.order(sym, side, abs(rem_amt_d), reduce_only=True, position_side=pos_side)
-                        ok_c, exec_c, avg_c, _ = client.verify_order_fill(sym, close_res, abs(rem_amt_d), is_entry=False, expected_side_dir=pos_side)
+                        ok_c, exec_c, avg_c, _ = client.verify_order_fill(sym, close_res, abs(rem_amt_d), is_entry=False, expected_side_dir=pos_side, pre_pos_qty=abs(rem_amt_d))
                         exact_p = client.get_order_net_pnl(sym, close_res, entry_price_ref=float(entry_price_d))
                         client.cancel_tracked_sl_only(sym)
                         delete_db_position_state(sym)
@@ -1794,7 +1834,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
                     if abs(rem_amt_d) > Decimal('0'):
                         notified_close_ts[sym] = time.time()
                         close_res = client.order(sym, sl_side, abs(rem_amt_d), reduce_only=True, position_side=pos_side)
-                        ok_c, exec_c, avg_c, _ = client.verify_order_fill(sym, close_res, abs(rem_amt_d), is_entry=False, expected_side_dir=pos_side)
+                        ok_c, exec_c, avg_c, _ = client.verify_order_fill(sym, close_res, abs(rem_amt_d), is_entry=False, expected_side_dir=pos_side, pre_pos_qty=abs(rem_amt_d))
                         exact_p = client.get_order_net_pnl(sym, close_res, entry_price_ref=float(entry_price_d))
                         client.cancel_tracked_sl_only(sym)
                         delete_db_position_state(sym)
@@ -1824,7 +1864,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
                 side = 'SELL' if pos_amt_d > Decimal('0') else 'BUY'
                 pos_side = 'LONG' if pos_amt_d > Decimal('0') else 'SHORT'
                 order_res = client.order(sym, side, abs(pos_amt_d), reduce_only=True, position_side=pos_side)
-                ok_fill, exec_q, avg_exit_p, _ = client.verify_order_fill(sym, order_res, abs(pos_amt_d), is_entry=False, expected_side_dir=pos_side)
+                ok_fill, exec_q, avg_exit_p, _ = client.verify_order_fill(sym, order_res, abs(pos_amt_d), is_entry=False, expected_side_dir=pos_side, pre_pos_qty=abs(pos_amt_d))
                 exact_p = client.get_order_net_pnl(sym, order_res, entry_price_ref=float(entry_price_d))
                 client.cancel_tracked_sl_only(sym)
                 delete_db_position_state(sym)
@@ -1936,7 +1976,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
                 close_side = 'BUY' if pos_amt_d < Decimal('0') else 'SELL'
                 old_pos_side = 'SHORT' if pos_amt_d < Decimal('0') else 'LONG'
                 c_res = client.order(sym, close_side, abs(pos_amt_d), reduce_only=True, position_side=old_pos_side)
-                ok_c, exec_c, avg_c, _ = client.verify_order_fill(sym, c_res, abs(pos_amt_d), is_entry=False, expected_side_dir=old_pos_side)
+                ok_c, exec_c, avg_c, _ = client.verify_order_fill(sym, c_res, abs(pos_amt_d), is_entry=False, expected_side_dir=old_pos_side, pre_pos_qty=abs(pos_amt_d))
                 exact_p = client.get_order_net_pnl(sym, c_res, entry_price_ref=float(old_ep_d))
                 client.cancel_tracked_sl_only(sym)
                 delete_db_position_state(sym)
