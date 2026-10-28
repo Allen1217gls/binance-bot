@@ -26,7 +26,7 @@ BARK_SERVER_URL = os.getenv('BARK_SERVER_URL', 'https://api.day.app').strip().rs
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', '').strip()
 LINE_PUSH_ENABLED = os.getenv('LINE_PUSH_ENABLED', 'false').lower() in ('true', '1', 'yes')
 DEFAULT_SYMBOL = os.getenv('DEFAULT_SYMBOL', 'SOLUSDT').strip().upper()
-DAILY_MAX_DD_PCT = Decimal(os.getenv('DAILY_MAX_DD_PCT', '8.0'))
+DAILY_MAX_DD_PCT = Decimal(os.getenv('DAILY_MAX_DD_PCT', '20.0'))
 EMERGENCY_FLOOR_USDT = Decimal(os.getenv('EMERGENCY_FLOOR_USDT', '150.0'))
 MARGIN_ALERT_RATIO = Decimal(os.getenv('MARGIN_ALERT_RATIO', '60.0'))
 MAX_ENTRY_SLIPPAGE_PCT = Decimal(os.getenv('MAX_ENTRY_SLIPPAGE_PCT', '1.5'))
@@ -1849,8 +1849,6 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
             lock_tag = '✅ 已鎖定保本之上' if is_be_lock else '🛡️ 逐步墊高防線中'
             if stage == 'LOCK_BE':
                 send_line_push(f"🔒 【2.2R 尾倉推過成本保本】\n🪙 交易幣種：{fsym} ({('多單' if is_long_pos else '空單')})\n🏷️ 開倉成本：{ep_str}\n🔄 止損推進：{old_sl_str} ➔ {new_sl_str}\n✨ 狀態確認：尾倉已正式零風險奔跑")
-            elif stage == 'EARLY_CUSHION':
-                send_line_push(f"🛡️ 【0.9R 抗震盪提前縮緊止損】\n🪙 交易幣種：{fsym} ({('多單' if is_long_pos else '空單')})\n🏷️ 開倉成本：{ep_str}\n🔄 止損收窄：{old_sl_str} ➔ {new_sl_str} (-0.35R)\n✨ 防護效果：已砍除 65% 潛在回吐風險")
             else:
                 send_line_push(f"🐢 【海龜移動止損更新】\n🪙 交易幣種：{fsym} ({('多單' if is_long_pos else '空單')})\n🏷️ 開倉成本：{ep_str}\n🔄 止損移動：{old_sl_str} ➔ {new_sl_str}\n{lock_tag}")
             return {'success': True, 'new_sl': float(verified_sl_d)}
