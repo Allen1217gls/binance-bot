@@ -1442,7 +1442,7 @@ class Signal(BaseModel):
     leverage: Optional[int] = 40
     close_pct: Optional[float] = None
     signal_price: Optional[float] = None
-    use_tp2: Optional[bool] = False
+    use_tp2: Optional[bool] = True
 
 @app.get('/')
 def index():
@@ -1876,7 +1876,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
                 total_eq, _, _ = client.get_equity()
                 if total_eq > 0:
                     check_daily_circuit_breaker(total_eq)
-                title_c = '⏸️ 【盤整保護平倉完成】' if stage == 'CHOP_EXIT' else '🏁 【訊號觸發平倉完成】'
+                title_c = '🎯 【ZLSMA 均線破位止盈平倉】' if stage == 'ZLSMA_EXIT' else ('⏸️ 【盤整保護平倉完成】' if stage == 'CHOP_EXIT' else '🏁 【訊號觸發平倉完成】')
                 send_line_push(f"{title_c}\n🪙 交易幣種：{fsym} ({('多單' if pos_amt_d > Decimal('0') else '空單')})\n📦 平倉顆數：{_fmt_qty(close_q_f)} 顆\n🏷️ 開倉價格：{client.fmt_p(sym, entry_price_d)}\n📍 出場價格：{client.fmt_p(sym, exit_p_f)}\n💵 本筆損益：{_fmt_u(net_u, signed=True)}\n💰 帳戶權益：{total_eq:.2f} USDT")
             elif ok_pos_api and abs(pos_amt_d) == Decimal('0'):
                 if db_rec:
