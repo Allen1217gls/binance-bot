@@ -53,6 +53,15 @@ TW_TZ = timezone(timedelta(hours=8))
 
 webhook_lock = asyncio.Lock()
 state_lock = threading.RLock()
+sym_locks: Dict[str, threading.RLock] = {}
+inflight_entries: Dict[str, str] = {}
+
+def get_sym_lock(sym: str) -> threading.RLock:
+    s = sym.strip().upper()
+    with state_lock:
+        if s not in sym_locks:
+            sym_locks[s] = threading.RLock()
+        return sym_locks[s]
 VALID_ACTIONS = {'LONG', 'SHORT', 'ADD_LONG', 'ADD_SHORT', 'TP1_LONG', 'TP1_SHORT', 'TP2_LONG', 'TP2_SHORT', 'UPDATE_SL', 'CLOSE_LONG', 'CLOSE_SHORT'}
 TRADFI_SYMBOLS = {'SNDKUSDT', 'TSLAUSDT', 'NVDAUSDT', 'AAPLUSDT', 'COINUSDT', 'SPCXUSDT'}
 BOOL_FLAG_KEYS = ('manual_paused', 'circuit_breaker_tripped', 'emergency_brake_tripped', 'safe_mode_locked', 'allow_pyramiding', 'hourly_push_enabled', 'smart_maker_enabled', 'corr_guard_enabled', 'funding_guard_enabled')
@@ -184,6 +193,10 @@ def load_system_flags():
         pass
 
 def check_and_record_signal(sig_id: Optional[str], sig_time_ms: Optional[int], sym: str, action: str, stage: str, stop_loss: Optional[float], server_offset_ms: int=0) -> Tuple[bool, str]:
+    with state_lock:
+        return _check_and_record_signal_locked(sig_id, sig_time_ms, sym, action, stage, stop_loss, server_offset_ms)
+
+def _check_and_record_signal_locked(sig_id: Optional[str], sig_time_ms: Optional[int], sym: str, action: str, stage: str, stop_loss: Optional[float], server_offset_ms: int=0) -> Tuple[bool, str]:
     now_s = time.time()
     now_ms = int(now_s * 1000) + server_offset_ms
     if sig_time_ms is not None and sig_time_ms > 0:
@@ -218,6 +231,10 @@ def check_and_record_signal(sig_id: Optional[str], sig_time_ms: Optional[int], s
     return (True, eff_id)
 
 def upsert_db_position_state(sym: str, side: str, qty: Decimal, entry_price: Decimal, init_sl: Decimal, current_sl: Decimal, sl_algo_id: str, stage: str='INIT', entry_order_id: str='', trade_id: str=''):
+    with state_lock:
+        _upsert_db_position_state_locked(sym, side, qty, entry_price, init_sl, current_sl, sl_algo_id, stage, entry_order_id, trade_id)
+
+def _upsert_db_position_state_locked(sym: str, side: str, qty: Decimal, entry_price: Decimal, init_sl: Decimal, current_sl: Decimal, sl_algo_id: str, stage: str='INIT', entry_order_id: str='', trade_id: str=''):
     sym = sym.upper()
     now_s = time.time()
     tid = trade_id or f'{sym}_{int(now_s)}'
@@ -280,6 +297,10 @@ def get_all_db_positions() -> Dict[str, Dict[str, Any]]:
     return out
 
 def delete_db_position_state(sym: str):
+    with state_lock:
+        _delete_db_position_state_locked(sym)
+
+def _delete_db_position_state_locked(sym: str):
     sym = sym.upper()
     known_positions.pop(sym, None)
     try:
@@ -1087,6 +1108,9 @@ def compute_institutional_risk_multiplier(c: BinanceClient, sym: str, is_long: b
             is_be_safe = (stg in ('TP1_DONE', 'TP2_DONE', 'LOCK_BE')) or (is_long and sl_d >= ep_d > Decimal('0')) or (not is_long and Decimal('0') < sl_d <= ep_d)
             if not is_be_safe:
                 unhedged_peers.append(_disp_sym(other_sym))
+        for inf_sym, inf_side in list(inflight_entries.items()):
+            if inf_sym != sym.upper() and inf_side == target_side and _disp_sym(inf_sym) not in unhedged_peers:
+                unhedged_peers.append(_disp_sym(inf_sym))
         if unhedged_peers:
             mult *= Decimal('0.65')
             notes.append(f"同向未保本({','.join(unhedged_peers)})聯動降險0.65x")
@@ -1437,7 +1461,7 @@ class Signal(BaseModel):
     symbol: str
     action: str
     event_stage: Optional[str] = 'SIGNAL'
-    risk_pct: Optional[float] = 1.5
+    risk_pct: Optional[float] = 1.0
     stop_loss: Optional[float] = None
     leverage: Optional[int] = 40
     close_pct: Optional[float] = None
@@ -1721,7 +1745,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
     action = sig.action.strip().upper()
     stage = (sig.event_stage or action).strip().upper()
     fsym = _full_sym(sym)
-    with state_lock:
+    with get_sym_lock(sym):
         bot_state['last_symbol'] = sym
         ok_sig, sig_msg = check_and_record_signal(sig.signal_id, sig.signal_time, sym, action, stage, sig.stop_loss, client.time_offset)
         if not ok_sig:
@@ -1740,7 +1764,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
             side = 'SELL' if is_long_act else 'BUY'
             pos_side = 'LONG' if is_long_act else 'SHORT'
             curr_p_d = client.get_price_dec(sym) or entry_price_d
-            default_pct = Decimal('50.0') if is_tp1 else Decimal('66.67')
+            default_pct = (Decimal('40.0') if sig.use_tp2 else Decimal('50.0')) if is_tp1 else Decimal('66.67')
             raw_pct = _to_dec(sig.close_pct, str(default_pct))
             if raw_pct <= Decimal('0') or raw_pct >= Decimal('100'):
                 raw_pct = default_pct
@@ -1802,7 +1826,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
             upsert_db_position_state(sym=sym, side=pos_side, qty=actual_rem_d, entry_price=entry_price_d, init_sl=db_rec['init_sl_dec'] if db_rec else verified_sl_d, current_sl=verified_sl_d, sl_algo_id=final_aid, stage=target_stage if reduced_ok else (db_rec['stage'] if db_rec else 'BE_MOVED'), entry_order_id=db_rec['entry_order_id'] if db_rec else '', trade_id=db_rec['trade_id'] if db_rec else '')
             is_above_be = (is_long_act and verified_sl_d >= entry_price_d) or (not is_long_act and verified_sl_d <= entry_price_d)
             sl_label_s = '保本止損' if is_above_be else '緩衝止損'
-            title_str = ('🎯 【1.5R TP1 止盈與保本】' if is_above_be else '🎯 【1.5R TP1 減半鎖利】') if is_tp1 else '🚀 【3.0R TP2 二階止盈】'
+            title_str = ('🎯 【1.5R TP1 止盈與保本】' if is_above_be else f'🎯 【1.5R TP1 減倉{int(round(float(raw_pct)))}%鎖利】') if is_tp1 else '🚀 【3.0R TP2 二階止盈】'
             send_line_push(f'{title_str}\n🪙 交易幣種：{fsym}\n{tp_lines}🏷️ 開倉價格：{client.fmt_p(sym, entry_price_d)}\n🛡️ {sl_label_s}：{client.fmt_p(sym, verified_sl_d)}')
             return {'success': True, 'msg': f"{('TP1' if is_tp1 else 'TP2')}完成"}
 
@@ -1899,7 +1923,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
             curr_p_d = client.get_price_dec(sym)
             sl_d = client.quantize_price(sym, sig.stop_loss) if sig.stop_loss else Decimal('0')
             lev = int(sig.leverage or client._sym_leverage.get(sym, 40))
-            add_qty_d, q_msg = calculate_order_qty_decimal(client, sym, curr_p_d, sl_d, _to_dec(total_eq), _to_dec(avail), _to_dec(sig.risk_pct, '0.75'), lev, allow_min_notional_bump=False)
+            add_qty_d, q_msg = calculate_order_qty_decimal(client, sym, curr_p_d, sl_d, _to_dec(total_eq), _to_dec(avail), _to_dec(sig.risk_pct, '0.5'), lev, allow_min_notional_bump=False)
             if add_qty_d <= Decimal('0'):
                 return {'success': False, 'msg': f'加碼計算無效:{q_msg}'}
             side = 'BUY' if is_long_add else 'SELL'
@@ -1918,6 +1942,18 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
 
         if action in ('LONG', 'SHORT'):
             is_long = action == 'LONG'
+            with state_lock:
+                inflight_entries[sym] = 'LONG' if is_long else 'SHORT'
+            try:
+                return _execute_entry_sync(sig, sym, fsym, action, stage, is_long)
+            finally:
+                with state_lock:
+                    inflight_entries.pop(sym, None)
+    return {'success': True}
+
+def _execute_entry_sync(sig: Signal, sym: str, fsym: str, action: str, stage: str, is_long: bool) -> Dict[str, Any]:
+    if True:
+        if True:
             pos_amt_d, old_ep_d = client.get_position_info_dec(sym)
             curr_p_d = client.get_price_dec(sym)
             if curr_p_d <= Decimal('0') and sig.signal_price and float(sig.signal_price) > 0:
@@ -1964,7 +2000,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
 
             old_margin_u = abs(pos_amt_d) * curr_p_d / Decimal(str(eff_lev)) if has_reverse_pos else Decimal('0')
             est_avail_d = _to_dec(avail if avail > 0 else account_base) + old_margin_u
-            base_risk_d = _to_dec(sig.risk_pct, '1.5')
+            base_risk_d = _to_dec(sig.risk_pct, '1.0')
             eff_risk_d, inst_notes = compute_institutional_risk_multiplier(client, sym, is_long, base_risk_d, account_base)
             qty_d, q_reason = calculate_order_qty_decimal(client, sym, curr_p_d, sl_d, _to_dec(account_base), est_avail_d, eff_risk_d, eff_lev)
             if qty_d <= Decimal('0'):
@@ -2060,8 +2096,7 @@ async def handle_webhook(request: Request):
         sl_check = _to_dec(sig.stop_loss, '-1')
         if sl_check <= Decimal('0'):
             raise HTTPException(status_code=400, detail='無效的止損價格 (必須 > 0)')
-    async with webhook_lock:
-        return await asyncio.to_thread(_process_signal_sync, sig)
+    return await asyncio.to_thread(_process_signal_sync, sig)
 
 if __name__ == '__main__':
     import uvicorn
