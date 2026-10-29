@@ -63,7 +63,23 @@ def get_sym_lock(sym: str) -> threading.RLock:
             sym_locks[s] = threading.RLock()
         return sym_locks[s]
 VALID_ACTIONS = {'LONG', 'SHORT', 'ADD_LONG', 'ADD_SHORT', 'TP1_LONG', 'TP1_SHORT', 'TP2_LONG', 'TP2_SHORT', 'UPDATE_SL', 'CLOSE_LONG', 'CLOSE_SHORT'}
-TRADFI_SYMBOLS = {'SNDKUSDT', 'TSLAUSDT', 'NVDAUSDT', 'AAPLUSDT', 'COINUSDT', 'SPCXUSDT'}
+TRADFI_SYMBOLS = {'SNDKUSDT', 'TSLAUSDT', 'NVDAUSDT', 'AAPLUSDT', 'COINUSDT', 'SPCXUSDT', 'CLUSDT', 'XAUUSDT', 'XAGUSDT'}
+EQUITY_BASKET = {'SNDKUSDT', 'TSLAUSDT', 'NVDAUSDT', 'AAPLUSDT', 'COINUSDT', 'SPCXUSDT'}
+METAL_BASKET = {'XAUUSDT', 'XAGUSDT'}
+ENERGY_BASKET = {'CLUSDT'}
+INVERSE_CRYPTO_SYMBOLS = {'BTCDOMUSDT'}
+
+def _get_asset_basket_and_polarity(sym: str) -> Tuple[str, int]:
+    s = sym.strip().upper()
+    if s in METAL_BASKET:
+        return ('METAL', 1)
+    if s in ENERGY_BASKET:
+        return ('ENERGY', 1)
+    if s in EQUITY_BASKET:
+        return ('EQUITY', 1)
+    if s in INVERSE_CRYPTO_SYMBOLS:
+        return ('CRYPTO', -1)
+    return ('CRYPTO', 1)
 BOOL_FLAG_KEYS = ('manual_paused', 'circuit_breaker_tripped', 'emergency_brake_tripped', 'safe_mode_locked', 'allow_pyramiding', 'hourly_push_enabled', 'smart_maker_enabled', 'corr_guard_enabled', 'funding_guard_enabled')
 FLOAT_FLAG_KEYS = ('max_daily_dd_pct', 'emergency_floor_usdt', 'max_entry_slippage_pct', 'max_margin_pct', 'max_notional_mult')
 STR_FLAG_KEYS = ('safe_mode_reason', 'bound_user_id', 'last_symbol')
@@ -508,7 +524,7 @@ class BinanceClient:
             tick_d, p_dec, step_d, q_dec = (Decimal('0.0001'), 4, Decimal('0.1'), 1)
         else:
             tick_d, p_dec, step_d, q_dec = (Decimal('0.000001'), 6, Decimal('1'), 0)
-        fallback_min_not = Decimal('100.0') if 'BTC' in sym else (Decimal('20.0') if 'ETH' in sym else Decimal('5.0'))
+        fallback_min_not = Decimal('100.0') if ('BTC' in sym and 'BTCDOM' not in sym) else (Decimal('20.0') if any(k in sym for k in ('ETH', 'XAU', 'BTCDOM')) else Decimal('5.0'))
         return {'step': step_d, 'tick': tick_d, 'min_notional': fallback_min_not, 'min_qty': step_d, 'price_dec': p_dec, 'qty_dec': q_dec}
 
     def quantize_qty(self, sym: str, raw_qty: Any, round_up: bool=False) -> Decimal:
@@ -1097,23 +1113,35 @@ def compute_institutional_risk_multiplier(c: BinanceClient, sym: str, is_long: b
             notes.append(f'逆向費率順風({fr_pct:+.3f}%)')
     if bot_state.get('corr_guard_enabled', True):
         db_map = get_all_db_positions()
-        target_side = 'LONG' if is_long else 'SHORT'
+        my_basket, my_pol = _get_asset_basket_and_polarity(sym)
+        my_risk_dir = (1 if is_long else -1) * my_pol
         unhedged_peers = []
         for other_sym, rec in db_map.items():
-            if other_sym == sym.upper() or rec.get('side') != target_side:
+            if other_sym == sym.upper():
+                continue
+            o_basket, o_pol = _get_asset_basket_and_polarity(other_sym)
+            if o_basket != my_basket:
+                continue
+            o_is_long = rec.get('side') == 'LONG'
+            o_risk_dir = (1 if o_is_long else -1) * o_pol
+            if o_risk_dir != my_risk_dir:
                 continue
             ep_d = rec.get('entry_price_dec', Decimal('0'))
             sl_d = rec.get('current_sl_dec', Decimal('0'))
             stg = str(rec.get('stage', ''))
-            is_be_safe = (stg in ('TP1_DONE', 'TP2_DONE', 'LOCK_BE')) or (is_long and sl_d >= ep_d > Decimal('0')) or (not is_long and Decimal('0') < sl_d <= ep_d)
+            is_be_safe = (stg in ('TP1_DONE', 'TP2_DONE', 'LOCK_BE')) or (o_is_long and sl_d >= ep_d > Decimal('0')) or (not o_is_long and Decimal('0') < sl_d <= ep_d)
             if not is_be_safe:
                 unhedged_peers.append(_disp_sym(other_sym))
         for inf_sym, inf_side in list(inflight_entries.items()):
-            if inf_sym != sym.upper() and inf_side == target_side and _disp_sym(inf_sym) not in unhedged_peers:
+            if inf_sym == sym.upper():
+                continue
+            o_basket, o_pol = _get_asset_basket_and_polarity(inf_sym)
+            o_risk_dir = (1 if inf_side == 'LONG' else -1) * o_pol
+            if o_basket == my_basket and o_risk_dir == my_risk_dir and _disp_sym(inf_sym) not in unhedged_peers:
                 unhedged_peers.append(_disp_sym(inf_sym))
         if unhedged_peers:
             mult *= Decimal('0.65')
-            notes.append(f"同向未保本({','.join(unhedged_peers)})聯動降險0.65x")
+            notes.append(f"同籃同向未保本({','.join(unhedged_peers)})聯動降險0.65x")
     if equity_u > 0:
         td_pnl = get_today_realized_pnl_u()
         if td_pnl < 0 and abs(td_pnl) / equity_u * 100.0 >= 3.5:
