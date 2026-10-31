@@ -48,6 +48,7 @@ ALLOW_PYRAMIDING = os.getenv('ALLOW_PYRAMIDING', 'false').lower() in ('true', '1
 SMART_MAKER_ENABLED = os.getenv('SMART_MAKER_ENABLED', 'true').lower() in ('true', '1', 'yes')
 CORR_GUARD_ENABLED = os.getenv('CORR_GUARD_ENABLED', 'true').lower() in ('true', '1', 'yes')
 FUNDING_GUARD_ENABLED = os.getenv('FUNDING_GUARD_ENABLED', 'true').lower() in ('true', '1', 'yes')
+TRAIL_NOTIFY_ENABLED = os.getenv('TRAIL_NOTIFY_ENABLED', 'false').lower() in ('true', '1', 'yes')
 DB_PATH = os.getenv('DB_PATH', '/tmp/trades_history_v5.db')
 TW_TZ = timezone(timedelta(hours=8))
 
@@ -80,7 +81,7 @@ def _get_asset_basket_and_polarity(sym: str) -> Tuple[str, int]:
     if s in INVERSE_CRYPTO_SYMBOLS:
         return ('CRYPTO', -1)
     return ('CRYPTO', 1)
-BOOL_FLAG_KEYS = ('manual_paused', 'circuit_breaker_tripped', 'emergency_brake_tripped', 'safe_mode_locked', 'allow_pyramiding', 'hourly_push_enabled', 'smart_maker_enabled', 'corr_guard_enabled', 'funding_guard_enabled')
+BOOL_FLAG_KEYS = ('manual_paused', 'circuit_breaker_tripped', 'emergency_brake_tripped', 'safe_mode_locked', 'allow_pyramiding', 'hourly_push_enabled', 'smart_maker_enabled', 'corr_guard_enabled', 'funding_guard_enabled', 'trail_notify_enabled')
 FLOAT_FLAG_KEYS = ('max_daily_dd_pct', 'emergency_floor_usdt', 'max_entry_slippage_pct', 'max_margin_pct', 'max_notional_mult')
 STR_FLAG_KEYS = ('safe_mode_reason', 'bound_user_id', 'last_symbol')
 
@@ -91,7 +92,7 @@ bot_state: Dict[str, Any] = {
     'max_entry_slippage_pct': float(MAX_ENTRY_SLIPPAGE_PCT), 'max_margin_pct': float(MAX_MARGIN_PCT_PER_TRADE),
     'max_notional_mult': float(MAX_NOTIONAL_MULT), 'allow_pyramiding': ALLOW_PYRAMIDING,
     'hourly_push_enabled': False, 'smart_maker_enabled': SMART_MAKER_ENABLED,
-    'corr_guard_enabled': CORR_GUARD_ENABLED, 'funding_guard_enabled': FUNDING_GUARD_ENABLED,
+    'corr_guard_enabled': CORR_GUARD_ENABLED, 'funding_guard_enabled': FUNDING_GUARD_ENABLED, 'trail_notify_enabled': TRAIL_NOTIFY_ENABLED,
     'bound_user_id': LINE_USER_ID, 'last_symbol': DEFAULT_SYMBOL,
     'last_margin_alert_ts': 0.0, 'last_auto_reconcile_ts': 0.0,
     'consecutive_api_failures': 0, 'api_disconnected_alerted': False
@@ -1658,6 +1659,18 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
                 daily_start_balance = get_or_save_daily_start_eq(eq, force_reset=True)
             save_system_flags()
             return '🟢 【人工重置熔斷完成】\n📊 今日基準：已重設為當前權益'
+        if text in ('11', '海龜', '海龜通知', '移動通知', '止損通知'):
+            bot_state['trail_notify_enabled'] = not bot_state.get('trail_notify_enabled', False)
+            save_system_flags()
+            return f"🐢 海龜移動止損推播：{('🟢 已開啟' if bot_state['trail_notify_enabled'] else '🔕 已關閉 (後台仍正常移動止損單)')}"
+        if upper_text in ('海龜 開', '海龜通知 開', '移動通知 開', '止損通知 開', 'TRAIL ON'):
+            bot_state['trail_notify_enabled'] = True
+            save_system_flags()
+            return '🐢 海龜移動止損推播：🟢 已開啟'
+        if upper_text in ('海龜 關', '海龜通知 關', '移動通知 關', '止損通知 關', 'TRAIL OFF'):
+            bot_state['trail_notify_enabled'] = False
+            save_system_flags()
+            return '🐢 海龜移動止損推播：🔕 已關閉 (後台仍正常移動止損單)'
         if text in ('8', '整點推播', '每小時推播'):
             bot_state['hourly_push_enabled'] = not bot_state['hourly_push_enabled']
             save_system_flags()
@@ -1739,6 +1752,7 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
             f"🔹 「8」開關每小時整點推播\n"
             f"🔹 「9」查看近 7 日統計週報\n"
             f"🔹 「10」對齊倉位解安全鎖\n"
+            f"🔹 「11」開關海龜移動止損推播\n"
             f"🔹 「限價 開/關」BBO限價優先\n"
             f"🔹 「同向 開/關」跨幣同向降險\n"
             f"🔹 「費率 開/關」費率過熱濾網\n"
@@ -1903,7 +1917,7 @@ def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
                 send_line_push(f"🔒 【2.2R 尾倉推過成本保本】\n🪙 交易幣種：{fsym} ({('多單' if is_long_pos else '空單')})\n🏷️ 開倉成本：{ep_str}\n🔄 止損推進：{old_sl_str} ➔ {new_sl_str}\n✨ 狀態確認：尾倉已正式零風險奔跑")
             elif stage == 'EARLY_CUSHION':
                 send_line_push(f"🛡️ 【0.9R 抗震盪提前縮緊止損】\n🪙 交易幣種：{fsym} ({('多單' if is_long_pos else '空單')})\n🏷️ 開倉成本：{ep_str}\n🔄 止損收窄：{old_sl_str} ➔ {new_sl_str} (-0.35R)\n✨ 防護效果：已砍除 65% 潛在回吐風險")
-            else:
+            elif bot_state.get('trail_notify_enabled', False):
                 send_line_push(f"🐢 【海龜移動止損更新】\n🪙 交易幣種：{fsym} ({('多單' if is_long_pos else '空單')})\n🏷️ 開倉成本：{ep_str}\n🔄 止損移動：{old_sl_str} ➔ {new_sl_str}\n{lock_tag}")
             return {'success': True, 'new_sl': float(verified_sl_d)}
 
