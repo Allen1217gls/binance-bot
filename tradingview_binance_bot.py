@@ -31,7 +31,7 @@ EMERGENCY_FLOOR_USDT = Decimal(os.getenv('EMERGENCY_FLOOR_USDT', '150.0'))
 MARGIN_ALERT_RATIO = Decimal(os.getenv('MARGIN_ALERT_RATIO', '60.0'))
 MAX_ENTRY_SLIPPAGE_PCT = Decimal(os.getenv('MAX_ENTRY_SLIPPAGE_PCT', '1.5'))
 MAX_MARGIN_PCT_PER_TRADE = Decimal(os.getenv('MAX_MARGIN_PCT_PER_TRADE', '20.0'))
-MAX_NOTIONAL_MULT = Decimal(os.getenv('MAX_NOTIONAL_MULT', '3.2'))
+MAX_NOTIONAL_MULT = Decimal(os.getenv('MAX_NOTIONAL_MULT', '5.0'))
 MAX_MIN_NOTIONAL_RISK_PCT = Decimal(os.getenv('MAX_MIN_NOTIONAL_RISK_PCT', '3.2'))
 SLIPPAGE_WARN_PCT = Decimal(os.getenv('SLIPPAGE_WARN_PCT', '0.5'))
 BE_BUFFER_PCT = Decimal(os.getenv('BE_BUFFER_PCT', '0.15'))
@@ -46,8 +46,8 @@ RETAIN_OLD_ON_NEW_REJECT = os.getenv('RETAIN_OLD_ON_NEW_REJECT', 'true').lower()
 STRICT_ONE_WAY_ONLY = os.getenv('STRICT_ONE_WAY_ONLY', 'false').lower() in ('true', '1', 'yes')
 ALLOW_PYRAMIDING = os.getenv('ALLOW_PYRAMIDING', 'false').lower() in ('true', '1', 'yes')
 SMART_MAKER_ENABLED = os.getenv('SMART_MAKER_ENABLED', 'true').lower() in ('true', '1', 'yes')
-CORR_GUARD_ENABLED = os.getenv('CORR_GUARD_ENABLED', 'true').lower() in ('true', '1', 'yes')
-FUNDING_GUARD_ENABLED = os.getenv('FUNDING_GUARD_ENABLED', 'true').lower() in ('true', '1', 'yes')
+CORR_GUARD_ENABLED = os.getenv('CORR_GUARD_ENABLED', 'false').lower() in ('true', '1', 'yes')
+FUNDING_GUARD_ENABLED = os.getenv('FUNDING_GUARD_ENABLED', 'false').lower() in ('true', '1', 'yes')
 TRAIL_NOTIFY_ENABLED = os.getenv('TRAIL_NOTIFY_ENABLED', 'false').lower() in ('true', '1', 'yes')
 DB_PATH = os.getenv('DB_PATH', '/tmp/trades_history_v5.db')
 TW_TZ = timezone(timedelta(hours=8))
@@ -206,6 +206,15 @@ def load_system_flags():
                     if k == 'bound_user_id' and not str(v).strip():
                         continue
                     bot_state[k] = str(v)
+            mig = conn.execute("SELECT v FROM system_flags WHERE k = 'v58_equal_r_mig'").fetchone()
+            if not mig:
+                bot_state['max_notional_mult'] = float(MAX_NOTIONAL_MULT)
+                bot_state['corr_guard_enabled'] = CORR_GUARD_ENABLED
+                bot_state['funding_guard_enabled'] = FUNDING_GUARD_ENABLED
+                bot_state['trail_notify_enabled'] = TRAIL_NOTIFY_ENABLED
+                conn.execute("INSERT OR REPLACE INTO system_flags (k, v) VALUES ('v58_equal_r_mig', '1')")
+                conn.commit()
+        save_system_flags()
     except Exception:
         pass
 
@@ -666,11 +675,12 @@ class BinanceClient:
         p['signature'] = self._sign(p)
         r2 = self._safe_request('GET', '/fapi/v2/account', params=p)
         if isinstance(r2, dict) and 'code' not in r2 and ('totalMarginBalance' in r2 or 'totalWalletBalance' in r2):
-            eq = float(r2.get('totalMarginBalance', r2.get('totalWalletBalance', 0.0)))
+            wallet_bal = float(r2.get('totalWalletBalance', 0.0))
+            margin_bal = float(r2.get('totalMarginBalance', wallet_bal))
             avail = float(r2.get('availableBalance', 0.0))
             maint = float(r2.get('totalMaintMargin', 0.0))
-            total_eq = max(eq, avail)
-            return (total_eq, avail, maint / total_eq * 100.0 if total_eq > 0 else 0.0, r2)
+            total_eq = max(wallet_bal, margin_bal, avail)
+            return (total_eq, avail, maint / margin_bal * 100.0 if margin_bal > 0 else 0.0, r2)
         res = self._safe_request('GET', '/fapi/v2/balance', params=p)
         if isinstance(res, list):
             for b in res:
@@ -1143,7 +1153,7 @@ def compute_institutional_risk_multiplier(c: BinanceClient, sym: str, is_long: b
         if unhedged_peers:
             mult *= Decimal('0.65')
             notes.append(f"同籃同向未保本({','.join(unhedged_peers)})聯動降險0.65x")
-    if equity_u > 0:
+    if bot_state.get('corr_guard_enabled', False) and equity_u > 0:
         td_pnl = get_today_realized_pnl_u()
         if td_pnl < 0 and abs(td_pnl) / equity_u * 100.0 >= 3.5:
             mult *= Decimal('0.75')
@@ -1175,7 +1185,7 @@ def calculate_order_qty_decimal(c: BinanceClient, sym: str, entry_price: Decimal
             raw_risk_qty = bump_qty
     lev_d = Decimal(str(max(1, leverage)))
     max_margin_pct_d = _to_dec(bot_state['max_margin_pct'], '20.0') / Decimal('100')
-    max_notional_mult_d = _to_dec(bot_state['max_notional_mult'], '3.2')
+    max_notional_mult_d = _to_dec(bot_state['max_notional_mult'], '5.0')
     max_margin_qty = equity_u * max_margin_pct_d * lev_d / entry_price
     max_notional_qty = equity_u * max_notional_mult_d / entry_price
     eff_avail = avail_u if avail_u > Decimal('0') else equity_u
