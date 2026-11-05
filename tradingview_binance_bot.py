@@ -44,10 +44,10 @@ SIGNAL_DEDUP_SEC = float(os.getenv('SIGNAL_DEDUP_SEC', '300.0'))
 EMERGENCY_SL_FALLBACK_PCT = Decimal(os.getenv('EMERGENCY_SL_FALLBACK_PCT', '2.5'))
 RETAIN_OLD_ON_NEW_REJECT = os.getenv('RETAIN_OLD_ON_NEW_REJECT', 'true').lower() in ('true', '1', 'yes')
 STRICT_ONE_WAY_ONLY = os.getenv('STRICT_ONE_WAY_ONLY', 'false').lower() in ('true', '1', 'yes')
-ALLOW_PYRAMIDING = os.getenv('ALLOW_PYRAMIDING', 'false').lower() in ('true', '1', 'yes')
+ALLOW_PYRAMIDING = os.getenv('ALLOW_PYRAMIDING', 'true').lower() in ('true', '1', 'yes')
 SMART_MAKER_ENABLED = os.getenv('SMART_MAKER_ENABLED', 'true').lower() in ('true', '1', 'yes')
-CORR_GUARD_ENABLED = os.getenv('CORR_GUARD_ENABLED', 'true').lower() in ('true', '1', 'yes')
-FUNDING_GUARD_ENABLED = os.getenv('FUNDING_GUARD_ENABLED', 'true').lower() in ('true', '1', 'yes')
+CORR_GUARD_ENABLED = os.getenv('CORR_GUARD_ENABLED', 'false').lower() in ('true', '1', 'yes')
+FUNDING_GUARD_ENABLED = os.getenv('FUNDING_GUARD_ENABLED', 'false').lower() in ('true', '1', 'yes')
 TRAIL_NOTIFY_ENABLED = os.getenv('TRAIL_NOTIFY_ENABLED', 'false').lower() in ('true', '1', 'yes')
 DB_PATH = os.getenv('DB_PATH', '/tmp/trades_history_v5.db')
 TW_TZ = timezone(timedelta(hours=8))
@@ -276,17 +276,17 @@ def load_system_flags():
                     if k == 'bound_user_id' and not str(v).strip():
                         continue
                     bot_state[k] = str(v)
-            mig_v60 = conn.execute("SELECT v FROM system_flags WHERE k = 'v60_user_defaults_mig'").fetchone()
-            if not mig_v60:
+            mig_v62 = conn.execute("SELECT v FROM system_flags WHERE k = 'v62_user_defaults_mig'").fetchone()
+            if not mig_v62:
                 bot_state['smart_maker_enabled'] = True
-                bot_state['corr_guard_enabled'] = True
-                bot_state['funding_guard_enabled'] = True
-                bot_state['allow_pyramiding'] = False
+                bot_state['allow_pyramiding'] = True
+                bot_state['corr_guard_enabled'] = False
+                bot_state['funding_guard_enabled'] = False
                 bot_state['max_margin_pct'] = 20.0
                 bot_state['max_notional_mult'] = 5.0
                 bot_state['max_daily_dd_pct'] = 8.0
                 bot_state['emergency_floor_usdt'] = 1563.0
-                conn.execute("INSERT OR REPLACE INTO system_flags (k, v) VALUES ('v60_user_defaults_mig', '1')")
+                conn.execute("INSERT OR REPLACE INTO system_flags (k, v) VALUES ('v62_user_defaults_mig', '1')")
                 conn.commit()
         save_system_flags()
     except Exception:
@@ -1505,9 +1505,9 @@ def build_status_report(title: str='【即時帳戶與持倉查詢】') -> str:
         daily_pnl_str = '+0.00U (+0.0%)'
 
     maker_st = '已開啟' if bot_state.get('smart_maker_enabled', True) else '已關閉'
-    corr_st = '已開啟' if bot_state.get('corr_guard_enabled', True) else '已關閉'
-    fund_st = '已開啟' if bot_state.get('funding_guard_enabled', True) else '已關閉'
-    pyr_st = '已開啟' if bot_state.get('allow_pyramiding', False) else '已關閉'
+    corr_st = '已開啟' if bot_state.get('corr_guard_enabled', False) else '已關閉'
+    fund_st = '已開啟' if bot_state.get('funding_guard_enabled', False) else '已關閉'
+    pyr_st = '已開啟' if bot_state.get('allow_pyramiding', True) else '已關閉'
     hr_st = '已開啟' if bot_state.get('hourly_push_enabled', False) else '已關閉'
     tr_st = '已開啟' if bot_state.get('trail_notify_enabled', False) else '已關閉'
 
@@ -1578,9 +1578,9 @@ def build_aligned_menu() -> str:
         run_st = '正常接單'
     safe_st = '安全鎖定' if bot_state.get('safe_mode_locked', False) else '正常無鎖'
     maker_st = '已開啟' if bot_state.get('smart_maker_enabled', True) else '已關閉'
-    corr_st = '已開啟' if bot_state.get('corr_guard_enabled', True) else '已關閉'
-    fund_st = '已開啟' if bot_state.get('funding_guard_enabled', True) else '已關閉'
-    pyr_st = '已開啟' if bot_state.get('allow_pyramiding', False) else '已關閉'
+    corr_st = '已開啟' if bot_state.get('corr_guard_enabled', False) else '已關閉'
+    fund_st = '已開啟' if bot_state.get('funding_guard_enabled', False) else '已關閉'
+    pyr_st = '已開啟' if bot_state.get('allow_pyramiding', True) else '已關閉'
     hr_st = '已開啟' if bot_state.get('hourly_push_enabled', False) else '已關閉'
     tr_st = '已開啟' if bot_state.get('trail_notify_enabled', False) else '已關閉'
 
