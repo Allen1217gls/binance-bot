@@ -104,7 +104,7 @@ recent_signals_cache: Dict[str, float] = {}
 last_entry_ts: Dict[str, float] = {}
 notified_close_ts: Dict[str, float] = {}
 known_positions: Dict[str, Dict[str, Any]] = {}
-trade_logs_mem: List[Tuple[str, str, str, float]] = []
+trade_logs_mem: List[Tuple[str, str, str, str, float, float, float]] = []
 
 def _normalize_digits(s: str) -> str:
     return s.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
@@ -441,6 +441,7 @@ def record_trade_log(symbol: str, stage: str, pos_amt: float, close_qty: float, 
     if close_qty <= 0 or entry_price <= 0 or exit_price <= 0:
         return 0.0
     is_long = pos_amt > 0
+    side_s = 'LONG' if is_long else 'SHORT'
     if exact_pnl is not None:
         net_pnl = float(exact_pnl)
     else:
@@ -449,13 +450,13 @@ def record_trade_log(symbol: str, stage: str, pos_amt: float, close_qty: float, 
         net_pnl = raw_pnl - (entry_price + exit_price) * close_qty * fee_r
     pnl_pct = (exit_price - entry_price) / entry_price * 100.0 if is_long else (entry_price - exit_price) / entry_price * 100.0
     now_str = datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M:%S')
-    trade_logs_mem.append((now_str, symbol.upper(), stage, float(net_pnl)))
+    trade_logs_mem.append((now_str, symbol.upper(), stage, side_s, float(entry_price), float(exit_price), float(net_pnl)))
     if len(trade_logs_mem) > 500:
         del trade_logs_mem[:-300]
     try:
         with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
             conn.execute('PRAGMA journal_mode=WAL;')
-            conn.execute('INSERT INTO trade_logs (ts, symbol, stage, side, qty, entry_price, exit_price, pnl_usdt, pnl_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (now_str, symbol.upper(), stage, 'LONG' if is_long else 'SHORT', float(close_qty), float(entry_price), float(exit_price), float(net_pnl), float(pnl_pct)))
+            conn.execute('INSERT INTO trade_logs (ts, symbol, stage, side, qty, entry_price, exit_price, pnl_usdt, pnl_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (now_str, symbol.upper(), stage, side_s, float(close_qty), float(entry_price), float(exit_price), float(net_pnl), float(pnl_pct)))
             conn.commit()
     except Exception:
         pass
@@ -470,51 +471,161 @@ def get_today_realized_pnl_u() -> float:
                 return float(row[0])
     except Exception:
         pass
-    return sum((r[3] for r in trade_logs_mem if r[0].startswith(today_p)))
+    return sum((r[6] for r in trade_logs_mem if r[0].startswith(today_p)))
 
-def build_trade_stats_report(days: int=7) -> str:
+def _consolidate_position_trades(raw_rows: List[Tuple[str, str, str, str, float, float, float]]) -> List[Dict[str, Any]]:
+    """將同一筆開倉的分批減倉(TP1/TP2/手動減半)與最終平倉合併為「1次完整開單紀錄」，確保開單次數與勝率100%精準"""
+    partial_stages = {'TP1', 'TP2', 'MANUAL_HALF'}
+    chron_rows = list(raw_rows)
+    open_buckets: Dict[str, Dict[str, Any]] = {}
+    consolidated: List[Dict[str, Any]] = []
+    for ts_s, sym, stg, side_s, ep_f, ex_f, pnl_f in chron_rows:
+        sym_u = str(sym or '').upper()
+        stg_u = str(stg or '').upper()
+        side_u = str(side_s or 'LONG').upper()
+        ep_val = float(ep_f or 0.0)
+        pnl_val = float(pnl_f or 0.0)
+        b_key = f'{sym_u}_{side_u}'
+        existing = open_buckets.get(b_key)
+        same_entry = existing is not None and (ep_val <= 0 or existing['entry_price'] <= 0 or abs(ep_val - existing['entry_price']) / max(ep_val, existing['entry_price'], 1e-8) <= 0.015)
+        if stg_u in partial_stages:
+            if existing and same_entry:
+                existing['pnl'] += pnl_val
+                existing['parts'] += 1
+                existing['last_ts'] = ts_s
+            else:
+                if existing:
+                    consolidated.append(open_buckets.pop(b_key))
+                open_buckets[b_key] = {
+                    'symbol': sym_u, 'side': side_u, 'entry_price': ep_val,
+                    'pnl': pnl_val, 'parts': 1, 'start_ts': ts_s, 'last_ts': ts_s, 'final_stage': stg_u
+                }
+        else:
+            if existing and same_entry:
+                existing['pnl'] += pnl_val
+                existing['parts'] += 1
+                existing['last_ts'] = ts_s
+                existing['final_stage'] = stg_u
+                consolidated.append(open_buckets.pop(b_key))
+            else:
+                if existing:
+                    consolidated.append(open_buckets.pop(b_key))
+                consolidated.append({
+                    'symbol': sym_u, 'side': side_u, 'entry_price': ep_val,
+                    'pnl': pnl_val, 'parts': 1, 'start_ts': ts_s, 'last_ts': ts_s, 'final_stage': stg_u
+                })
+    for rem in open_buckets.values():
+        consolidated.append(rem)
+    return consolidated
+
+def build_trade_stats_report(period_mode: str='WEEK', target_sym: Optional[str]=None) -> str:
     now_tw = datetime.now(TW_TZ)
-    cutoff = (now_tw - timedelta(days=days)).strftime('%Y-%m-%d 00:00:00')
-    today_p = now_tw.strftime('%Y-%m-%d')
-    rows = []
+    mode_u = (period_mode or 'WEEK').upper()
+    if mode_u in ('DAY', 'DAILY', '1', '91', '日報'):
+        cutoff = now_tw.strftime('%Y-%m-%d 00:00:00')
+        report_title = '【量化交易統計・日報】'
+        range_label = f"今日 ({now_tw.strftime('%m/%d')} 00:00起)"
+    elif mode_u in ('MONTH', 'MONTHLY', '30', '93', '月報'):
+        start_dt = now_tw - timedelta(days=30)
+        cutoff = start_dt.strftime('%Y-%m-%d 00:00:00')
+        report_title = '【量化交易統計・月報】'
+        range_label = f"近30日 ({start_dt.strftime('%m/%d')}~{now_tw.strftime('%m/%d')})"
+    else:
+        start_dt = now_tw - timedelta(days=7)
+        cutoff = start_dt.strftime('%Y-%m-%d 00:00:00')
+        report_title = '【量化交易統計・週報】'
+        range_label = f"近7日 ({start_dt.strftime('%m/%d')}~{now_tw.strftime('%m/%d')})"
+
+    norm_filter = _norm_sym(target_sym) if target_sym else None
+    raw_rows: List[Tuple[str, str, str, str, float, float, float]] = []
     try:
         with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
-            rows = conn.execute('SELECT ts, symbol, stage, pnl_usdt FROM trade_logs WHERE ts >= ? ORDER BY id DESC', (cutoff,)).fetchall()
+            if norm_filter:
+                raw_rows = conn.execute('SELECT ts, symbol, stage, side, entry_price, exit_price, pnl_usdt FROM trade_logs WHERE ts >= ? AND symbol = ? ORDER BY id ASC', (cutoff, norm_filter)).fetchall()
+            else:
+                raw_rows = conn.execute('SELECT ts, symbol, stage, side, entry_price, exit_price, pnl_usdt FROM trade_logs WHERE ts >= ? ORDER BY id ASC', (cutoff,)).fetchall()
     except Exception:
-        rows = [r for r in reversed(trade_logs_mem) if r[0] >= cutoff]
-    if not rows and trade_logs_mem:
-        rows = [r for r in reversed(trade_logs_mem) if r[0] >= cutoff]
-    if not rows:
+        raw_rows = [r for r in trade_logs_mem if r[0] >= cutoff and (not norm_filter or r[1] == norm_filter)]
+    if not raw_rows and trade_logs_mem:
+        raw_rows = [r for r in trade_logs_mem if r[0] >= cutoff and (not norm_filter or r[1] == norm_filter)]
+
+    if not raw_rows:
+        sym_tag = f' ({_full_sym(norm_filter)})' if norm_filter else ''
         return (
-            f"【近 {days} 日交易統計週報】\n"
+            f"{report_title}{sym_tag}\n"
             f"{DIV_LINE}\n"
-            f"統計時間：{now_tw.strftime('%m-%d %H:%M')}\n"
-            f"目前紀錄：尚無已結算紀錄"
+            f"統計區間：{range_label}\n"
+            f"查詢時間：{now_tw.strftime('%m-%d %H:%M')}\n"
+            f"目前紀錄：尚無已結算交易\n"
+            f"{DIV_LINE}\n"
+            f"切換報表：91日報/92週報/93月報"
         )
-    wins = [r[3] for r in rows if r[3] > 0]
-    losses = [abs(r[3]) for r in rows if r[3] <= 0]
-    total_net = sum((r[3] for r in rows))
-    wr = len(wins) / len(rows) * 100.0
-    avg_w = sum(wins) / len(wins) if wins else 0.0
-    avg_l = sum(losses) / len(losses) if losses else 0.0
-    rr = avg_w / avg_l if avg_l > 0 else (99.9 if avg_w > 0 else 0.0)
-    td_rows = [r for r in rows if r[0].startswith(today_p)]
-    td_net = sum((r[3] for r in td_rows))
-    td_wr = len([r for r in td_rows if r[3] > 0]) / len(td_rows) * 100.0 if td_rows else 0.0
-    return (
-        f"【近 {days} 日交易統計週報】\n"
-        f"{DIV_LINE}\n"
-        f"統計時間：{now_tw.strftime('%m-%d %H:%M')}\n"
-        f"結算筆數：{len(rows)} 筆\n"
-        f"週總勝率：{wr:.1f}% ({len(wins)}勝{len(losses)}敗)\n"
-        f"週總淨利：{_fmt_u(total_net, signed=True)}\n"
-        f"均盈虧比：{rr:.2f}\n"
-        f"均賺均賠：+{avg_w:.1f}U / -{avg_l:.1f}U\n"
-        f"最大單筆：+{(max(wins) if wins else 0.0):.2f}U\n"
-        f"{DIV_LINE}\n"
-        f"今日結算：{len(td_rows)} 筆 (勝{td_wr:.0f}%)\n"
-        f"今日實現：{_fmt_u(td_net, signed=True)}"
-    )
+
+    trades = _consolidate_position_trades(raw_rows)
+    total_cnt = len(trades)
+    long_cnt = sum(1 for t in trades if t['side'] == 'LONG')
+    short_cnt = total_cnt - long_cnt
+    wins = [t['pnl'] for t in trades if t['pnl'] > 0]
+    losses = [abs(t['pnl']) for t in trades if t['pnl'] <= 0]
+    win_cnt = len(wins)
+    loss_cnt = len(losses)
+    wr = (win_cnt / total_cnt * 100.0) if total_cnt > 0 else 0.0
+    total_net = sum(t['pnl'] for t in trades)
+    avg_w = (sum(wins) / win_cnt) if win_cnt > 0 else 0.0
+    avg_l = (sum(losses) / loss_cnt) if loss_cnt > 0 else 0.0
+    rr = (avg_w / avg_l) if avg_l > 0 else (99.9 if avg_w > 0 else 0.0)
+    pf = (sum(wins) / sum(losses)) if sum(losses) > 0 else (99.9 if sum(wins) > 0 else 0.0)
+    max_w = max(wins) if wins else 0.0
+    max_l = max(losses) if losses else 0.0
+
+    lines = [
+        f"{report_title}",
+        f"{DIV_LINE}",
+        f"統計區間：{range_label}",
+        f"總開單數：{total_cnt} 次 (多{long_cnt}/空{short_cnt})",
+        f"總勝敗數：{win_cnt}勝 {loss_cnt}敗",
+        f"整體勝率：{wr:.1f}%",
+        f"總計盈虧：{_fmt_u(total_net, signed=True)}",
+        f"均賺均賠：+{avg_w:.1f}U / -{avg_l:.1f}U",
+        f"均盈虧比：{rr:.2f} (PF {pf:.2f})",
+        f"最大獲利：+{max_w:.2f}U",
+        f"最大虧損：-{max_l:.2f}U",
+        f"{DIV_LINE}",
+        f"【各幣種獨立戰績明細】"
+    ]
+
+    # Group by symbol
+    by_sym: Dict[str, List[Dict[str, Any]]] = {}
+    for t in trades:
+        by_sym.setdefault(t['symbol'], []).append(t)
+
+    # Sort coins by total count desc, then net PnL desc
+    sorted_syms = sorted(by_sym.keys(), key=lambda s: (len(by_sym[s]), sum(x['pnl'] for x in by_sym[s])), reverse=True)
+    for sym_k in sorted_syms:
+        s_trades = by_sym[sym_k]
+        s_cnt = len(s_trades)
+        s_long = sum(1 for x in s_trades if x['side'] == 'LONG')
+        s_short = s_cnt - s_long
+        s_wins = [x['pnl'] for x in s_trades if x['pnl'] > 0]
+        s_losses = [abs(x['pnl']) for x in s_trades if x['pnl'] <= 0]
+        s_w_cnt = len(s_wins)
+        s_l_cnt = len(s_losses)
+        s_wr = (s_w_cnt / s_cnt * 100.0) if s_cnt > 0 else 0.0
+        s_net = sum(x['pnl'] for x in s_trades)
+        s_best = max(s_wins) if s_wins else 0.0
+        s_worst = max(s_losses) if s_losses else 0.0
+        fsym = _full_sym(sym_k)
+        lines.append(
+            f"{DIV_LINE}\n"
+            f"◆ {fsym} (開單 {s_cnt} 次)\n"
+            f"勝敗戰績：{s_w_cnt}勝 {s_l_cnt}敗 ({s_wr:.1f}%)\n"
+            f"多空次數：多{s_long}次 / 空{s_short}次\n"
+            f"單幣盈虧：{_fmt_u(s_net, signed=True)}\n"
+            f"最佳最差：+{s_best:.1f}U / -{s_worst:.1f}U"
+        )
+
+    lines.append(f"{DIV_LINE}\n切換報表：91日報/92週報/93月報")
+    return '\n'.join(lines)
 
 def send_line_push(text: str, to_user_id: Optional[str]=None):
     def _push():
@@ -1596,7 +1707,9 @@ def build_aligned_menu() -> str:
         f"０６｜人工暫停開立新倉位\n"
         f"０７｜恢復自動接收新訊號\n"
         f"０８｜切換整點巡檢的推播\n"
-        f"０９｜查看近七日統計週報\n"
+        f"９１｜查看今日的統計日報\n"
+        f"９２｜查看近七日統計週報\n"
+        f"９３｜查看三十日統計月報\n"
         f"１０｜對齊倉位並解安全鎖\n"
         f"１１｜切換移動止損的推播\n"
         f"{DIV_LINE}\n"
@@ -1945,8 +2058,14 @@ def execute_line_command(cmd_text: str, user_id: str) -> str:
             bot_state['hourly_push_enabled'] = False
             save_system_flags()
             return '整點｜整點推播：已關閉'
-        if text in ('9', '統計', '週報', '戰績', '報表', '歷史'):
-            return build_trade_stats_report(days=7)
+        m_rep = re.match('^(91|日報|今日報表|今日統計|92|0?9|週報|周報|統計|戰績|報表|歷史|93|月報|月統計)(?:\s+([A-Z0-9]+))?$', upper_text)
+        if m_rep:
+            rk, r_sym = (m_rep.group(1), m_rep.group(2))
+            if rk in ('91', '日報', '今日報表', '今日統計'):
+                return build_trade_stats_report(period_mode='DAY', target_sym=r_sym)
+            if rk in ('93', '月報', '月統計'):
+                return build_trade_stats_report(period_mode='MONTH', target_sym=r_sym)
+            return build_trade_stats_report(period_mode='WEEK', target_sym=r_sym)
         if text in ('10', '安全', '安全 關', '對齊', '巡檢', '檢查止損', '解除安全'):
             bot_state['safe_mode_locked'] = False
             bot_state['safe_mode_reason'] = ''
@@ -2033,7 +2152,7 @@ async def line_webhook(request: Request):
     return {'status': 'ok'}
 
 def _process_signal_sync(sig: Signal) -> Dict[str, Any]:
-    sym = sig.symbol.strip().upper()
+    sym = re.sub(r'\.P$', '', sig.symbol.strip().upper())
     action = sig.action.strip().upper()
     stage = (sig.event_stage or action).strip().upper()
     fsym = _full_sym(sym)
@@ -2526,7 +2645,7 @@ async def handle_webhook(request: Request):
         raise HTTPException(status_code=400, detail=f'Invalid payload: {e}')
     if not secrets.compare_digest(sig.passphrase, WEBHOOK_PASSPHRASE):
         raise HTTPException(status_code=401, detail='密碼錯誤')
-    sym = sig.symbol.strip().upper()
+    sym = re.sub(r'\.P$', '', sig.symbol.strip().upper())
     action = sig.action.strip().upper()
     if action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f'未授權之交易動作: {action}')
